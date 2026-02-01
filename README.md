@@ -40,6 +40,19 @@ In this example:
 *   `010_first-scene` uses the **Parallel** structure: its content is in `010_chapter-one/010_first-scene.md`.
 *   `020_chapter-two.notes` is a **Dot-child** of `020_chapter-two`.
 
+#### Entity Mapping
+
+The above layout maps to the following entity tree and logical paths:
+
+```
+Project (path: "")
+├── 010_chapter-one (path: "/010_chapter-one")
+│   ├── 010_first-scene (path: "/010_chapter-one/010_first-scene")
+│   └── 020_second-scene (path: "/010_chapter-one/020_second-scene")
+└── 020_chapter-two (path: "/020_chapter-two")
+    └── notes (path: "/020_chapter-two.notes")
+```
+
 ### Hierarchy
 
 Children of an entity can be associated in two ways:
