@@ -24,17 +24,21 @@ Both forms cannot exist for the same entity simultaneously.
 
 ```
 my-project/
-├── 010_chapter-one/        <-- "Inside" structure (directory)
-│   ├── 010_first-scene.md  <-- "Parallel" structure (file)
+├── 010_chapter-one/             <-- "Inside" structure (directory)
+│   ├── content.md               <-- Content for 010_chapter-one
+│   ├── 010_first-scene.md       <-- "Parallel" structure (file)
 │   ├── 020_second-scene.md
-│   └── meta.toml           <-- Metadata for 010_chapter-one
-├── 020_chapter-two.md      <-- "Parallel" structure
-└── project.meta.toml       <-- Metadata for the root project (Parallel)
+│   └── meta.toml                <-- Metadata for 010_chapter-one
+├── 020_chapter-two.md           <-- "Parallel" structure
+├── 020_chapter-two.notes.md     <-- "Dot-child" of 020_chapter-two
+├── 020_chapter-two.meta.toml    <-- Metadata for 020_chapter-two
+└── project.meta.toml            <-- Metadata for the root project (Parallel)
 ```
 
 In this example:
 *   `010_chapter-one` uses the **Inside** structure: its metadata is in `010_chapter-one/meta.toml`.
 *   `010_first-scene` uses the **Parallel** structure: its content is in `010_chapter-one/010_first-scene.md`.
+*   `020_chapter-two.notes` is a **Dot-child** of `020_chapter-two`.
 
 ### Hierarchy
 
@@ -60,6 +64,7 @@ use inscenerator_entity::entity::{EntityTypeDescription, ChildEntityRules, Entit
 fn setup_loader() -> EntityLoader {
     let mut loader = EntityLoader::new();
 
+    // Create a rule for children with a specific prefix
     fn child_entity(node_type: &str) -> ChildEntityRules {
         ChildEntityRules {
             name_regex: "^[0-9]+_".to_string(),
@@ -69,6 +74,7 @@ fn setup_loader() -> EntityLoader {
         }
     }
 
+    // Helper to add an entity type to the loader
     fn add_entity(loader: &mut EntityLoader, name: &str, children: &[ChildEntityRules]) {
         loader.entity_types.insert(
             name.to_string(),
@@ -94,20 +100,23 @@ fn setup_loader() -> EntityLoader {
 use inscenerator_entity::entity::{EntityLoader, EntityWriter, EntityPath};
 use xfs::OsFs;
 use std::path::Path;
+use anyhow::anyhow;
 
 fn main() -> anyhow::Result<()> {
     let mut fs = OsFs {}; // Implementation of Xfs
     let base_path = Path::new("./my-project");
     let loader = setup_loader();
+    let writer = EntityWriter {};
 
     // Loading an entity tree
-    if let Some(entity) = loader.try_load_entity(&fs, &base_path, &EntityPath::empty(), "Project")? {
-        println!("Loaded entity: {}", entity.node_type);
+    let entity = loader
+        .try_load_entity(&fs, &base_path, &EntityPath::empty(), "Project")?
+        .ok_or_else(|| anyhow!("Project not found"))?;
 
-        // Saving an entity tree
-        let writer = EntityWriter {};
-        writer.write_entity(&mut fs, &base_path, &entity)?;
-    }
+    println!("Loaded entity: {}", entity.node_type);
+
+    // Saving an entity tree
+    writer.write_entity(&mut fs, &base_path, &entity)?;
 
     Ok(())
 }
