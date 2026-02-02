@@ -374,15 +374,15 @@ impl EntityLoader {
         let directory_exists = fs.is_dir(&entity_path.to_pathbuf(base_path));
         let dot_content_file = entity_path.to_pathbuf(base_path).with_added_extension("md");
         let slash_content_file = entity_path.to_pathbuf(base_path).join("content.md");
-        let dot_content_str = if !is_root {
+        let dot_content = if !is_root {
             utils::try_load_file_as_string(fs, &dot_content_file)?
         } else {
             None
         };
-        let slash_content_str = utils::try_load_file_as_string(fs, &slash_content_file)?;
+        let slash_content = utils::try_load_file_as_string(fs, &slash_content_file)?;
 
         let mut metadata_from_content = None;
-        let content: EntityContent = match (dot_content_str, slash_content_str) {
+        let content: EntityContent = match (dot_content, slash_content) {
             (Some(_), Some(_)) => bail!(
                 "Both {} and {} exist.",
                 dot_content_file.display(),
@@ -390,7 +390,7 @@ impl EntityLoader {
             ),
             (Some(c), None) => {
                 if let Some((m, sep, actual)) = utils::parse_header(&c) {
-                    metadata_from_content = Some(EntityMeta::InParallelHeader(m, sep));
+                    metadata_from_content = Some(EntityMeta::InHeader(m, sep));
                     EntityContent::Parallel(actual)
                 } else {
                     EntityContent::Parallel(c)
@@ -398,7 +398,7 @@ impl EntityLoader {
             }
             (None, Some(c)) => {
                 if let Some((m, sep, actual)) = utils::parse_header(&c) {
-                    metadata_from_content = Some(EntityMeta::InInsideHeader(m, sep));
+                    metadata_from_content = Some(EntityMeta::InHeader(m, sep));
                     EntityContent::Inside(actual)
                 } else {
                     EntityContent::Inside(c)
@@ -530,9 +530,7 @@ impl EntityWriter {
         match &entity.content {
             EntityContent::Parallel(content) => {
                 let mut content_to_write = String::new();
-                if let EntityMeta::InParallelHeader(m, sep) | EntityMeta::InInsideHeader(m, sep) =
-                    &entity.metadata
-                {
+                if let EntityMeta::InHeader(m, sep) = &entity.metadata {
                     let toml_str = toml::to_string(&m.value)?;
                     content_to_write.push_str(&format!("```toml\n{}```\n", toml_str));
                     if let Some(sep_str) = sep {
@@ -546,9 +544,7 @@ impl EntityWriter {
             }
             EntityContent::Inside(content) => {
                 let mut content_to_write = String::new();
-                if let EntityMeta::InParallelHeader(m, sep) | EntityMeta::InInsideHeader(m, sep) =
-                    &entity.metadata
-                {
+                if let EntityMeta::InHeader(m, sep) = &entity.metadata {
                     let toml_str = toml::to_string(&m.value)?;
                     content_to_write.push_str(&format!("```toml\n{}```\n", toml_str));
                     if let Some(sep_str) = sep {
@@ -559,28 +555,14 @@ impl EntityWriter {
                 fs.writer(&entity_path.join("content.md"))?
                     .write_all(content_to_write.as_bytes())?;
             }
-            EntityContent::None => match &entity.metadata {
-                EntityMeta::InParallelHeader(m, sep) => {
-                    let toml_str = toml::to_string(&m.value)?;
-                    let mut content_to_write = format!("```toml\n{}```\n", toml_str);
-                    if let Some(sep_str) = sep {
-                        content_to_write.push_str(sep_str);
-                    }
-                    let dot_content_file = entity_path.with_added_extension("md");
-                    fs.writer(&dot_content_file)?
-                        .write_all(content_to_write.as_bytes())?;
+            EntityContent::None => {
+                if let EntityMeta::InHeader(_, _) = &entity.metadata {
+                    bail!(
+                        "Metadata from header requires content for entity at {:?}",
+                        entity.path.to_pathbuf(base_path)
+                    );
                 }
-                EntityMeta::InInsideHeader(m, sep) => {
-                    let toml_str = toml::to_string(&m.value)?;
-                    let mut content_to_write = format!("```toml\n{}```\n", toml_str);
-                    if let Some(sep_str) = sep {
-                        content_to_write.push_str(sep_str);
-                    }
-                    fs.writer(&entity_path.join("content.md"))?
-                        .write_all(content_to_write.as_bytes())?;
-                }
-                _ => {}
-            },
+            }
         }
 
         match &entity.metadata {
@@ -595,9 +577,7 @@ impl EntityWriter {
                 fs.writer(&entity_path.join("meta.toml"))?
                     .write_all(toml_str.as_bytes())?;
             }
-            EntityMeta::None
-            | EntityMeta::InParallelHeader(_, _)
-            | EntityMeta::InInsideHeader(_, _) => {}
+            EntityMeta::None | EntityMeta::InHeader(_, _) => {}
         }
 
         for child in &entity.children {
@@ -650,10 +630,8 @@ pub enum EntityMeta {
     Parallel(Metadata),
     /// metadata is found at entity/meta.toml
     Inside(Metadata),
-    /// metadata is found in entity.md
-    InParallelHeader(Metadata, Option<String>),
-    /// metadata is found in entity/content.md
-    InInsideHeader(Metadata, Option<String>),
+    /// metadata is found in the content file
+    InHeader(Metadata, Option<String>),
 }
 
 impl EntityMeta {
@@ -666,8 +644,7 @@ impl EntityMeta {
             EntityMeta::None => None,
             EntityMeta::Parallel(m) => Some(m),
             EntityMeta::Inside(m) => Some(m),
-            EntityMeta::InParallelHeader(m, _) => Some(m),
-            EntityMeta::InInsideHeader(m, _) => Some(m),
+            EntityMeta::InHeader(m, _) => Some(m),
         }
     }
 
@@ -680,10 +657,7 @@ impl EntityMeta {
     }
 
     fn is_inside(&self) -> bool {
-        matches!(
-            self,
-            EntityMeta::Inside(_) | EntityMeta::InInsideHeader(_, _)
-        )
+        matches!(self, EntityMeta::Inside(_))
     }
 }
 
@@ -1447,11 +1421,11 @@ mod entity_tests {
             .unwrap();
         let e = entity.expect("Entity should be loaded");
         assert_eq!(e.content, EntityContent::parallel("Actual content"));
-        if let EntityMeta::InParallelHeader(m, sep) = e.metadata {
+        if let EntityMeta::InHeader(m, sep) = e.metadata {
             assert_eq!(m.value.get("foo").unwrap().as_str().unwrap(), "bar");
             assert!(sep.is_none());
         } else {
-            panic!("Expected InParallelHeader metadata, got {:?}", e.metadata);
+            panic!("Expected InHeader metadata, got {:?}", e.metadata);
         }
     }
 
@@ -1470,11 +1444,11 @@ mod entity_tests {
             .unwrap();
         let e = entity.expect("Entity should be loaded");
         assert_eq!(e.content, EntityContent::parallel("\nActual content"));
-        if let EntityMeta::InParallelHeader(m, sep) = e.metadata {
+        if let EntityMeta::InHeader(m, sep) = e.metadata {
             assert_eq!(m.value.get("foo").unwrap().as_str().unwrap(), "bar");
             assert_eq!(sep.unwrap(), "\n---\n".to_string());
         } else {
-            panic!("Expected InParallelHeader metadata, got {:?}", e.metadata);
+            panic!("Expected InHeader metadata, got {:?}", e.metadata);
         }
     }
 
@@ -1555,7 +1529,7 @@ mod entity_tests {
                 .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType")
                 .unwrap()
                 .unwrap();
-            if let EntityMeta::InParallelHeader(_, Some(sep)) = e.metadata {
+            if let EntityMeta::InHeader(_, Some(sep)) = e.metadata {
                 assert!(sep.contains(b));
             } else {
                 panic!("Expected separator for break {}", b);
