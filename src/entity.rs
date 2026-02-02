@@ -112,7 +112,8 @@ mod utils {
         let mut child_names: BTreeSet<String> = BTreeSet::new();
 
         let p_dot_str = format!("{}.", p_str);
-        fs.on_each_entry(entity_dir, &mut |_fs, de| -> anyhow::Result<()> {
+        for de in fs.read_dir(entity_dir)? {
+            let de = de?;
             let entry_path = de.path();
             let Some(entry_path_str) = entry_path.to_str() else {
                 bail!("child path {entry_path:?} not converable to srting")
@@ -121,15 +122,15 @@ mod utils {
             // Now we only want something like entity.suffix (where suffix might contain more '.' characters.)
             // Throw away the start, just keeping the suffix.
             let Some(suffix) = entry_path_str.strip_prefix(&p_dot_str) else {
-                return Ok(());
+                continue;
             };
 
             // We want to skip a couple of special cases
             if suffix == "md" {
-                return Ok(());
+                continue;
             }
             if suffix == "meta.toml" {
-                return Ok(());
+                continue;
             }
 
             // Now if the suffix is of the form 'name.rest' we just want name, but if there is no '.'
@@ -140,8 +141,8 @@ mod utils {
             };
 
             child_names.insert(name.to_string());
-            Ok(())
-        })?;
+        }
+
         Ok(child_names
             .into_iter()
             .map(|name| entity_path.extend(EntityPathEntry::Dot(name)))
@@ -158,19 +159,20 @@ mod utils {
             return Ok(vec![]);
         }
         let mut child_names: BTreeSet<String> = BTreeSet::new();
-        fs.on_each_entry(&entity_dir, &mut |_fs, de| -> anyhow::Result<()> {
+
+        for de in fs.read_dir(&entity_dir)? {
+            let de = de?;
             let entry_path = de.path();
             if let Some(full_filename) = entry_path.file_name() {
                 if full_filename == "content.md" || full_filename == "meta.toml" {
-                    return Ok(());
+                    continue;
                 }
             }
             let Some(name) = entry_path.file_prefix().and_then(|s| s.to_str()) else {
                 bail!("Entry path {:?} has no filename", entry_path);
             };
             child_names.insert(name.to_string());
-            Ok(())
-        })?;
+        }
         Ok(child_names
             .into_iter()
             .map(|name| entity_path.extend(EntityPathEntry::Slash(name)))
