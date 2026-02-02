@@ -281,8 +281,6 @@ impl EntityLoader {
         entity_path: &EntityPath,
         entity_type: &str,
     ) -> anyhow::Result<Option<Entity>> {
-        let entity_type_descriptor = self.get_entity_type(entity_type)?;
-
         // Root element is special
         let is_root = entity_path.entries.is_empty();
         if is_root {
@@ -350,6 +348,44 @@ impl EntityLoader {
 
         let has_children = !children.is_empty();
 
+        if content.is_none() && metadata.is_none() && !has_children && !directory_exists {
+            return Ok(None);
+        }
+
+        // Determine the actual type
+        let actual_type = if entity_type == "Auto" {
+            let m = metadata.metadata().ok_or_else(|| {
+                anyhow!(
+                    "Entity at '{:?}' has Auto type but no metadata",
+                    entity_path.to_pathbuf(base_path)
+                )
+            })?;
+            let t = m.get_str("type")?.ok_or_else(|| {
+                anyhow!(
+                    "Entity at '{:?}' has Auto type but metadata is missing 'type' key",
+                    entity_path.to_pathbuf(base_path)
+                )
+            })?;
+            if t == "Auto" {
+                bail!(
+                    "Entity at '{:?}' has metadata 'type' set to 'Auto', which is not allowed",
+                    entity_path.to_pathbuf(base_path)
+                );
+            }
+            t
+        } else {
+            if let Some(m) = metadata.metadata() {
+                if let Some(t) = m.get_str("type")? {
+                    if t != entity_type {
+                        bail!("Entity at '{:?}' has type '{}' in metadata, but was expected to be '{}'", entity_path.to_pathbuf(base_path), t, entity_type);
+                    }
+                }
+            }
+            entity_type.to_string()
+        };
+
+        let entity_type_descriptor = self.get_entity_type(&actual_type)?;
+
         // Work through the children and load them.
         let mut loaded_children: Vec<Entity> = vec![];
         for child_entity_path in children {
@@ -371,7 +407,7 @@ impl EntityLoader {
                     }
                 }
             }
-            if !found_match && !self.get_entity_type(entity_type)?.allow_additional {
+            if !found_match && !entity_type_descriptor.allow_additional {
                 bail!(
                     "Unexpected child entity '{}' in entity '{:?}'",
                     child_name,
@@ -380,13 +416,9 @@ impl EntityLoader {
             }
         }
 
-        if content.is_none() && metadata.is_none() && !has_children && !directory_exists {
-            return Ok(None);
-        }
-
         let entity = Entity {
             path: entity_path.clone(),
-            node_type: entity_type.to_string(),
+            node_type: actual_type,
             content,
             metadata,
             children: loaded_children,
@@ -1274,6 +1306,174 @@ mod entity_tests {
             .unwrap()
             .to_string();
         assert_eq!(child2_content, "Child 2 content");
+    }
+
+    #[test]
+    fn test_load_entity_auto_type_success() {
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "foo", "entity1.meta.toml", "type=\"TestType\"\n");
+        let fs = fs;
+
+        let loader = dummy_loader();
+        let entity_path = EntityPath::empty().extend_slash("entity1");
+
+        let entity = loader
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "Auto")
+            .unwrap();
+        let e = entity.unwrap();
+        assert_eq!(e.node_type, "TestType".to_string());
+    }
+
+    #[test]
+    fn test_load_entity_auto_type_no_metadata_errors() {
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "foo/entity1", "content.md", "Hello");
+        let fs = fs;
+
+        let loader = dummy_loader();
+        let entity_path = EntityPath::empty().extend_slash("entity1");
+
+        let result = loader.try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "Auto");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("has Auto type but no metadata"));
+    }
+
+    #[test]
+    fn test_load_entity_auto_type_missing_type_key_errors() {
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "foo", "entity1.meta.toml", "bar=\"baz\"\n");
+        let fs = fs;
+
+        let loader = dummy_loader();
+        let entity_path = EntityPath::empty().extend_slash("entity1");
+
+        let result = loader.try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "Auto");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("missing 'type' key"));
+    }
+
+    #[test]
+    fn test_load_entity_auto_type_resolves_to_auto_errors() {
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "foo", "entity1.meta.toml", "type=\"Auto\"\n");
+        let fs = fs;
+
+        let loader = dummy_loader();
+        let entity_path = EntityPath::empty().extend_slash("entity1");
+
+        let result = loader.try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "Auto");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("set to 'Auto', which is not allowed"));
+    }
+
+    #[test]
+    fn test_load_entity_concrete_type_matches_metadata_success() {
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "foo", "entity1.meta.toml", "type=\"TestType\"\n");
+        let fs = fs;
+
+        let loader = dummy_loader();
+        let entity_path = EntityPath::empty().extend_slash("entity1");
+
+        let entity = loader
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType")
+            .unwrap();
+        let e = entity.unwrap();
+        assert_eq!(e.node_type, "TestType".to_string());
+    }
+
+    #[test]
+    fn test_load_entity_concrete_type_mismatch_metadata_errors() {
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "foo", "entity1.meta.toml", "type=\"OtherType\"\n");
+        let fs = fs;
+
+        let loader = dummy_loader();
+        let entity_path = EntityPath::empty().extend_slash("entity1");
+
+        let result = loader.try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("has type 'OtherType' in metadata, but was expected to be 'TestType'"));
+    }
+
+    #[test]
+    fn test_load_child_auto_type_success() {
+        let mut fs = mockfs::MockFS::new();
+        // parent (TestType) -> child (Auto -> ChildTestType)
+        create_file_with_content(
+            &mut fs,
+            "foo/parent",
+            "child1.meta.toml",
+            "type=\"ChildTestType\"\n",
+        );
+        let fs = fs;
+
+        let mut loader = EntityLoader::new();
+        loader.entity_types.insert(
+            "TestType".to_string(),
+            EntityTypeDescription {
+                name: "TestType".to_string(),
+                children: vec![ChildEntityRules {
+                    name_regex: "^child.*$".to_string(),
+                    node_type: "Auto".to_string(),
+                    required: false,
+                    multiple: true,
+                }],
+                allow_additional: false,
+            },
+        );
+        loader.entity_types.insert(
+            "ChildTestType".to_string(),
+            EntityTypeDescription {
+                name: "ChildTestType".to_string(),
+                children: vec![],
+                allow_additional: false,
+            },
+        );
+
+        let entity_path = EntityPath::empty().extend_slash("parent");
+        let entity = loader
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType")
+            .unwrap();
+        let e = entity.unwrap();
+        assert_eq!(e.children.len(), 1);
+        assert_eq!(e.children[0].node_type, "ChildTestType");
+    }
+
+    #[test]
+    fn test_load_root_auto_type_success() {
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "project", "meta.toml", "type=\"Project\"\n");
+        let fs = fs;
+
+        let mut loader = EntityLoader::new();
+        loader.entity_types.insert(
+            "Project".to_string(),
+            EntityTypeDescription {
+                name: "Project".to_string(),
+                children: vec![],
+                allow_additional: true,
+            },
+        );
+
+        let entity_path = EntityPath::empty();
+        let entity = loader
+            .try_load_entity(&fs, &PathBuf::from("project"), &entity_path, "Auto")
+            .unwrap();
+        let e = entity.unwrap();
+        assert_eq!(e.node_type, "Project".to_string());
     }
 }
 
