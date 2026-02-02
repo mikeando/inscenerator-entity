@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
 use serde::{Deserialize, Serialize};
-use xfs::Xfs;
+use inscenerator_xfs::Xfs;
 
 // (Almost) Everything is an entity.
 //
@@ -572,7 +572,7 @@ mod common {
 #[cfg(test)]
 mod entity_tests {
 
-    use xfs::mockfs;
+    use inscenerator_xfs::mockfs;
 
     use super::common::*;
     use super::*;
