@@ -202,6 +202,83 @@ mod utils {
             Ok(None)
         }
     }
+
+    pub fn parse_header(content: &str) -> Option<(Metadata, Option<String>, String)> {
+        let thematic_break_re =
+            regex::Regex::new(r"^[ ]{0,3}(?:(?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\*[ \t]*){3,})[ \t]*$")
+                .unwrap();
+
+        // 1. Find the opening ```
+        let mut start_pos = 0;
+        let mut lines_iter = content.split_inclusive('\n');
+        let mut found_start = false;
+        for line in lines_iter.by_ref() {
+            if line.trim().is_empty() {
+                start_pos += line.len();
+                continue;
+            }
+            if line.starts_with("```") {
+                let rest = line[3..].trim();
+                if rest.is_empty() || rest == "toml" {
+                    found_start = true;
+                    start_pos += line.len();
+                    break;
+                }
+            }
+            return None; // Not a header
+        }
+        if !found_start {
+            return None;
+        }
+
+        // 2. Find the closing ```
+        let mut end_pos = start_pos;
+        let mut found_end = false;
+        let mut inner_toml = String::new();
+        for line in lines_iter.by_ref() {
+            if line.starts_with("```") && line[3..].trim().is_empty() {
+                found_end = true;
+                end_pos += line.len();
+                break;
+            }
+            inner_toml.push_str(line);
+            end_pos += line.len();
+        }
+        if !found_end {
+            return None;
+        }
+
+        // remove the trailing newline from inner_toml if present
+        let inner_toml_trimmed = inner_toml.trim_end_matches(['\n', '\r']);
+
+        let value: toml::Value = toml::from_str(inner_toml_trimmed).ok()?;
+        let metadata = Metadata { value };
+
+        // 3. Find optional separator
+        let mut separator: Option<String> = None;
+        let mut content_start_pos = end_pos;
+
+        let mut current_gap = String::new();
+        let mut temp_lines_iter = content[end_pos..].split_inclusive('\n');
+
+        for line in temp_lines_iter.by_ref() {
+            if thematic_break_re.is_match(line.trim_end_matches(['\n', '\r'])) {
+                current_gap.push_str(line);
+                separator = Some(current_gap);
+                content_start_pos = end_pos + separator.as_ref().unwrap().len();
+                break;
+            }
+            if !line.trim().is_empty() {
+                // Not a thematic break and not empty -> end of gap, no separator found
+                break;
+            }
+            current_gap.push_str(line);
+        }
+
+        let actual_content = content[content_start_pos..].to_string();
+
+        Some((metadata, separator, actual_content))
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -297,21 +374,35 @@ impl EntityLoader {
         let directory_exists = fs.is_dir(&entity_path.to_pathbuf(base_path));
         let dot_content_file = entity_path.to_pathbuf(base_path).with_added_extension("md");
         let slash_content_file = entity_path.to_pathbuf(base_path).join("content.md");
-        let dot_content = if !is_root {
-            utils::try_load_file_as_string(fs, &dot_content_file)
+
+        let (content_str, is_parallel) = if !is_root {
+            if let Some(c) = utils::try_load_file_as_string(fs, &dot_content_file)? {
+                if fs.is_file(&slash_content_file) {
+                    bail!(
+                        "Both {} and {} exist.",
+                        dot_content_file.display(),
+                        slash_content_file.display()
+                    );
+                }
+                (Some(c), true)
+            } else {
+                (utils::try_load_file_as_string(fs, &slash_content_file)?, false)
+            }
         } else {
-            Ok(None)
+            (utils::try_load_file_as_string(fs, &slash_content_file)?, false)
         };
-        let slash_content = utils::try_load_file_as_string(fs, &slash_content_file);
-        let content: EntityContent = match (dot_content?, slash_content?) {
-            (Some(_), Some(_)) => bail!(
-                "Both {} and {} exist.",
-                dot_content_file.display(),
-                slash_content_file.display()
-            ),
-            (Some(c), None) => EntityContent::Parallel(c),
-            (None, Some(c)) => EntityContent::Inside(c),
-            (None, None) => EntityContent::None,
+
+        let (content, metadata_from_content) = if let Some(c) = content_str {
+            let (m, a) = utils::parse_header(&c)
+                .map(|(m, s, a)| (Some(EntityMeta::InHeader(m, s)), a))
+                .unwrap_or((None, c));
+            if is_parallel {
+                (EntityContent::Parallel(a), m)
+            } else {
+                (EntityContent::Inside(a), m)
+            }
+        } else {
+            (EntityContent::None, None)
         };
 
         // Try loading the metadata
@@ -320,21 +411,30 @@ impl EntityLoader {
             .with_extension("meta.toml");
         let slash_metadata_file = entity_path.to_pathbuf(base_path).join("meta.toml");
         let dot_metadata = if !is_root {
-            utils::try_load_file_as_metadata(fs, &dot_metadata_file)
+            utils::try_load_file_as_metadata(fs, &dot_metadata_file)?
         } else {
-            Ok(None)
+            None
         };
-        let slash_metadata = utils::try_load_file_as_metadata(fs, &slash_metadata_file);
-        let metadata = match (dot_metadata?, slash_metadata?) {
-            (Some(_), Some(_)) => bail!(
-                "Both {} and {} exist.",
-                dot_metadata_file.display(),
-                slash_metadata_file.display()
-            ),
-            (Some(m), None) => EntityMeta::Parallel(m),
-            (None, Some(m)) => EntityMeta::Inside(m),
-            (None, None) => EntityMeta::None,
-        };
+        let slash_metadata = utils::try_load_file_as_metadata(fs, &slash_metadata_file)?;
+
+        let mut meta_sources = Vec::new();
+        if let Some(m) = dot_metadata {
+            meta_sources.push(EntityMeta::Parallel(m));
+        }
+        if let Some(m) = slash_metadata {
+            meta_sources.push(EntityMeta::Inside(m));
+        }
+        if let Some(m) = metadata_from_content {
+            meta_sources.push(m);
+        }
+
+        if meta_sources.len() > 1 {
+            bail!(
+                "Multiple metadata sources found for entity at {:?}.",
+                entity_path.to_pathbuf(base_path)
+            );
+        }
+        let metadata = meta_sources.into_iter().next().unwrap_or(EntityMeta::None);
 
         // Now get the children!
         let dot_children = if !is_root {
@@ -425,17 +525,31 @@ impl EntityWriter {
             fs.create_dir_all(&entity_path)?;
         }
 
-        match &entity.content {
-            EntityContent::Parallel(content) => {
-                let dot_content_file = entity_path.with_added_extension("md");
-                fs.writer(&dot_content_file)?
-                    .write_all(content.as_bytes())?;
+        if let Some(content) = entity.content.content() {
+            let mut to_write = String::new();
+            if let EntityMeta::InHeader(m, sep) = &entity.metadata {
+                to_write.push_str("```toml\n");
+                to_write.push_str(&toml::to_string(&m.value)?);
+                to_write.push_str("```\n");
+                if let Some(s) = sep {
+                    to_write.push_str(s);
+                } else if !content.starts_with('\n') {
+                    to_write.push_str("\n");
+                }
             }
-            EntityContent::Inside(content) => {
-                fs.writer(&entity_path.join("content.md"))?
-                    .write_all(content.as_bytes())?;
-            }
-            EntityContent::None => {}
+            to_write.push_str(content);
+
+            let path = match &entity.content {
+                EntityContent::Parallel(_) => entity_path.with_added_extension("md"),
+                EntityContent::Inside(_) => entity_path.join("content.md"),
+                _ => unreachable!(),
+            };
+            fs.writer(&path)?.write_all(to_write.as_bytes())?;
+        } else if let EntityMeta::InHeader(_, _) = &entity.metadata {
+            bail!(
+                "Metadata from header requires content for entity at {:?}",
+                entity.path.to_pathbuf(base_path)
+            );
         }
 
         match &entity.metadata {
@@ -450,7 +564,7 @@ impl EntityWriter {
                 fs.writer(&entity_path.join("meta.toml"))?
                     .write_all(toml_str.as_bytes())?;
             }
-            EntityMeta::None => {}
+            EntityMeta::None | EntityMeta::InHeader(_, _) => {}
         }
 
         for child in &entity.children {
@@ -503,6 +617,8 @@ pub enum EntityMeta {
     Parallel(Metadata),
     /// metadata is found at entity/meta.toml
     Inside(Metadata),
+    /// metadata is found in the content file
+    InHeader(Metadata, Option<String>),
 }
 
 impl EntityMeta {
@@ -515,6 +631,7 @@ impl EntityMeta {
             EntityMeta::None => None,
             EntityMeta::Parallel(m) => Some(m),
             EntityMeta::Inside(m) => Some(m),
+            EntityMeta::InHeader(m, _) => Some(m),
         }
     }
 
@@ -1274,6 +1391,114 @@ mod entity_tests {
             .unwrap()
             .to_string();
         assert_eq!(child2_content, "Child 2 content");
+    }
+
+    fn load_entity(fs: &dyn Xfs, base: &str, name: &str) -> Entity {
+        let loader = dummy_loader();
+        let entity_path = EntityPath::empty().extend_slash(name);
+        loader
+            .try_load_entity(fs, &PathBuf::from(base), &entity_path, "TestType")
+            .unwrap()
+            .expect("Entity should be loaded")
+    }
+
+    fn setup_and_load(content: &str) -> (Entity, mockfs::MockFS) {
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "foo", "entity1.md", content);
+        (load_entity(&fs, "foo", "entity1"), fs)
+    }
+
+    fn check_header_meta(
+        meta: &EntityMeta,
+        key: &str,
+        expected_val: &str,
+        expected_sep: Option<&str>,
+    ) {
+        if let EntityMeta::InHeader(m, sep) = meta {
+            assert_eq!(m.value.get(key).unwrap().as_str().unwrap(), expected_val);
+            assert_eq!(sep.as_deref(), expected_sep);
+        } else {
+            panic!("Expected InHeader metadata, got {:?}", meta);
+        }
+    }
+
+    #[test]
+    fn test_load_entity_with_header_no_separator() {
+        let content = "```toml\nfoo = \"bar\"\n```\n\nActual content";
+        let (e, _) = setup_and_load(content);
+        assert_eq!(e.content, EntityContent::parallel("\nActual content"));
+        check_header_meta(&e.metadata, "foo", "bar", None);
+    }
+
+    #[test]
+    fn test_load_entity_with_header_and_separator() {
+        let content = "```toml\nfoo = \"bar\"\n```\n\n---\n\nActual content";
+        let (e, _) = setup_and_load(content);
+        assert_eq!(e.content, EntityContent::parallel("\nActual content"));
+        check_header_meta(&e.metadata, "foo", "bar", Some("\n---\n"));
+    }
+
+    #[test]
+    fn test_load_entity_conflict_header_and_meta_toml() {
+        let content = "```toml\nfoo = \"bar\"\n```\nActual content";
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "foo", "entity1.md", content);
+        create_file_with_content(&mut fs, "foo", "entity1.meta.toml", "other = \"meta\"\n");
+
+        let loader = dummy_loader();
+        let entity_path = EntityPath::empty().extend_slash("entity1");
+        let result = loader.try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Multiple metadata sources"));
+    }
+
+    #[test]
+    fn test_round_trip_with_header() {
+        let content = "```toml\nfoo = \"bar\"\n```\n\n---\n\nActual content";
+
+        // 1. Load
+        let (e, mut fs) = setup_and_load(content);
+
+        // 2. Write to a new location
+        fs.create_dir_all(&PathBuf::from("bar")).unwrap();
+        let writer = EntityWriter {};
+        writer
+            .write_entity(&mut fs, &PathBuf::from("bar"), &e)
+            .unwrap();
+
+        // 3. Load from new location and verify
+        let e2 = load_entity(&fs, "bar", "entity1");
+        assert_eq!(e, e2);
+
+        // Verify file content exactly
+        let file_content_raw = &fs
+            .resolve_path(&PathBuf::from("bar/entity1.md"))
+            .unwrap()
+            .as_file()
+            .unwrap()
+            .contents;
+        let binding = file_content_raw.borrow();
+        let file_content = std::str::from_utf8(binding.as_slice()).unwrap();
+        assert_eq!(file_content, content);
+    }
+
+    #[test]
+    fn test_load_entity_with_various_thematic_breaks() {
+        let mut fs = mockfs::MockFS::new();
+        let breaks = vec!["---", "***", "___", " - - -", "  ***  ", "   ___ ___ ___"];
+        for (i, b) in breaks.iter().enumerate() {
+            let name = format!("entity{}", i);
+            let content = format!("```toml\nkey = \"{i}\"\n```\n{b}\nContent");
+            create_file_with_content(&mut fs, "foo", format!("{}.md", name), &content);
+        }
+
+        for (i, _) in breaks.iter().enumerate() {
+            let e = load_entity(&fs, "foo", &format!("entity{}", i));
+            check_header_meta(&e.metadata, "key", &i.to_string(), Some(&format!("{}\n", breaks[i])));
+        }
     }
 }
 
