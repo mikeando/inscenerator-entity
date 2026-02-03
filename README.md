@@ -134,3 +134,26 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 ```
+
+## Development
+
+### GitHub Codespaces / VS Code Dev Containers
+
+This repository includes a [devcontainer configuration](.devcontainer/devcontainer.json) that automatically sets up your development environment with:
+- Rust toolchain
+- rust-analyzer extension
+- TOML language support
+- Crates.io helper extension
+
+Simply open in GitHub Codespaces or use "Reopen in Container" in VS Code with the Dev Containers extension.
+
+### Local Development with inscenerator-xfs
+
+If you're developing both `inscenerator-entity` and `inscenerator-xfs` locally, you can override the crates.io dependency with a local path by creating `.cargo/config.toml`:
+
+```toml
+[patch.crates-io]
+inscenerator-xfs = { path = "../inscenerator-xfs" }
+```
+
+This file is gitignored and won't affect other developers or CI/CD.

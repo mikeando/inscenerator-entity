@@ -1,0 +1,24 @@
+{
+  "name": "Rust Development",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+  
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "serayuzgur.crates"
+      ],
+      "settings": {
+        "rust-analyzer.checkOnSave.command": "clippy",
+        "rust-analyzer.cargo.features": "all"
+      }
+    }
+  },
+
+  "postCreateCommand": "cargo fetch",
+
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  }
+}
