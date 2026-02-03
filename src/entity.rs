@@ -93,7 +93,7 @@ impl EntityPathEntry {
     }
 }
 
-mod utils {
+pub mod utils {
     use std::collections::BTreeSet;
 
     use super::*;
@@ -164,7 +164,10 @@ mod utils {
             let de = de?;
             let entry_path = de.path();
             if let Some(full_filename) = entry_path.file_name() {
-                if full_filename == "content.md" || full_filename == "meta.toml" {
+                if full_filename == "content.md"
+                    || full_filename == "meta.toml"
+                    || full_filename == "schema.toml"
+                {
                     continue;
                 }
             }
@@ -319,7 +322,7 @@ impl Metadata {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct ChildEntityRules {
     pub name_regex: String,
     pub node_type: String,
@@ -327,8 +330,9 @@ pub struct ChildEntityRules {
     pub multiple: bool,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct EntityTypeDescription {
+    #[serde(default)]
     pub name: String,
     pub children: Vec<ChildEntityRules>,
     pub allow_additional: bool,
