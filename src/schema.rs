@@ -3,24 +3,53 @@ use std::path::Path;
 
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
-use crate::entity::{EntityTypeDescription, Entity, EntityLoader, EntityPath};
+use crate::entity::{Entity, EntityLoader, EntityPath};
 use inscenerator_xfs::Xfs;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
+pub struct ChildEntityRules {
+    pub name_regex: String,
+    pub node_type: String,
+    pub required: bool,
+    pub multiple: bool,
+}
+
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+pub struct EntityTypeDescription {
+    pub name: String,
+    pub children: Vec<ChildEntityRules>,
+    pub allow_additional: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct Schema {
     pub entities: HashMap<String, EntityTypeDescription>,
+}
+
+#[derive(Deserialize)]
+struct RawEntityTypeDescription {
+    pub children: Vec<ChildEntityRules>,
+    pub allow_additional: bool,
 }
 
 impl Schema {
     pub fn load_from_file(fs: &dyn Xfs, path: &Path) -> anyhow::Result<Self> {
         let content = crate::entity::utils::try_load_file_as_string(fs, path)?
             .ok_or_else(|| anyhow!("Schema file not found at {:?}", path))?;
-        let mut entities: HashMap<String, EntityTypeDescription> = toml::from_str(&content)?;
-        for (key, val) in entities.iter_mut() {
-            if val.name.is_empty() {
-                val.name = key.clone();
-            }
-        }
+        let raw_entities: HashMap<String, RawEntityTypeDescription> = toml::from_str(&content)?;
+        let entities = raw_entities
+            .into_iter()
+            .map(|(name, raw)| {
+                (
+                    name.clone(),
+                    EntityTypeDescription {
+                        name,
+                        children: raw.children,
+                        allow_additional: raw.allow_additional,
+                    },
+                )
+            })
+            .collect();
         Ok(Schema { entities })
     }
 }

@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
-use serde::{Deserialize, Serialize};
 use inscenerator_xfs::Xfs;
+
+use crate::schema::EntityTypeDescription;
 
 // (Almost) Everything is an entity.
 //
@@ -322,21 +323,6 @@ impl Metadata {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-pub struct ChildEntityRules {
-    pub name_regex: String,
-    pub node_type: String,
-    pub required: bool,
-    pub multiple: bool,
-}
-
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-pub struct EntityTypeDescription {
-    #[serde(default)]
-    pub name: String,
-    pub children: Vec<ChildEntityRules>,
-    pub allow_additional: bool,
-}
 
 pub struct EntityLoader {
     pub entity_types: HashMap<String, EntityTypeDescription>,
@@ -696,6 +682,7 @@ pub struct Entity {
 #[cfg(test)]
 mod common {
     use super::*;
+    use crate::schema::ChildEntityRules;
 
     pub fn dummy_loader() -> EntityLoader {
         let mut loader = EntityLoader::new();
@@ -727,6 +714,7 @@ mod common {
 #[cfg(test)]
 mod entity_tests {
 
+    use crate::schema::ChildEntityRules;
     use inscenerator_xfs::mockfs;
 
     use super::common::*;
