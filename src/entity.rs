@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
-use serde::{Deserialize, Serialize};
 use inscenerator_xfs::Xfs;
+
+use crate::schema::EntityTypeDescription;
 
 // (Almost) Everything is an entity.
 //
@@ -93,7 +94,7 @@ impl EntityPathEntry {
     }
 }
 
-mod utils {
+pub mod utils {
     use std::collections::BTreeSet;
 
     use super::*;
@@ -164,7 +165,10 @@ mod utils {
             let de = de?;
             let entry_path = de.path();
             if let Some(full_filename) = entry_path.file_name() {
-                if full_filename == "content.md" || full_filename == "meta.toml" {
+                if full_filename == "content.md"
+                    || full_filename == "meta.toml"
+                    || full_filename == "schema.toml"
+                {
                     continue;
                 }
             }
@@ -319,20 +323,6 @@ impl Metadata {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-pub struct ChildEntityRules {
-    pub name_regex: String,
-    pub node_type: String,
-    pub required: bool,
-    pub multiple: bool,
-}
-
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-pub struct EntityTypeDescription {
-    pub name: String,
-    pub children: Vec<ChildEntityRules>,
-    pub allow_additional: bool,
-}
 
 pub struct EntityLoader {
     pub entity_types: HashMap<String, EntityTypeDescription>,
@@ -692,6 +682,7 @@ pub struct Entity {
 #[cfg(test)]
 mod common {
     use super::*;
+    use crate::schema::ChildEntityRules;
 
     pub fn dummy_loader() -> EntityLoader {
         let mut loader = EntityLoader::new();
@@ -723,6 +714,7 @@ mod common {
 #[cfg(test)]
 mod entity_tests {
 
+    use crate::schema::ChildEntityRules;
     use inscenerator_xfs::mockfs;
 
     use super::common::*;
