@@ -1,8 +1,6 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
-use serde::{Deserialize, Serialize};
 use inscenerator_xfs::Xfs;
 
 // (Almost) Everything is an entity.
@@ -93,7 +91,7 @@ impl EntityPathEntry {
     }
 }
 
-mod utils {
+pub(crate) mod utils {
     use std::collections::BTreeSet;
 
     use super::*;
@@ -319,36 +317,21 @@ impl Metadata {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-pub struct ChildEntityRules {
-    pub name_regex: String,
-    pub node_type: String,
-    pub required: bool,
-    pub multiple: bool,
-}
-
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-pub struct EntityTypeDescription {
-    pub name: String,
-    pub children: Vec<ChildEntityRules>,
-    pub allow_additional: bool,
-}
+use crate::schema::{Schema, EntityTypeDescription};
 
 pub struct EntityLoader {
-    pub entity_types: HashMap<String, EntityTypeDescription>,
+    pub schema: Schema,
 }
 
 impl EntityLoader {
     pub fn new() -> EntityLoader {
         EntityLoader {
-            entity_types: HashMap::new(),
+            schema: Schema::new(),
         }
     }
 
     pub fn get_entity_type(&self, entity_type: &str) -> anyhow::Result<&EntityTypeDescription> {
-        self.entity_types
-            .get(entity_type)
-            .ok_or_else(|| anyhow::anyhow!("Invalid entity type {}", entity_type))
+        self.schema.get_entity_type(entity_type)
     }
 
     pub fn try_load_entity(
@@ -689,14 +672,15 @@ pub struct Entity {
     pub children: Vec<Entity>,
 }
 
+
 #[cfg(test)]
 mod common {
     use super::*;
+    use crate::schema::ChildEntityRules;
 
     pub fn dummy_loader() -> EntityLoader {
         let mut loader = EntityLoader::new();
-        loader.entity_types.insert(
-            "TestType".to_string(),
+        loader.schema.add_entity_type(
             EntityTypeDescription {
                 name: "TestType".to_string(),
                 children: vec![ChildEntityRules {
@@ -708,8 +692,7 @@ mod common {
                 allow_additional: false,
             },
         );
-        loader.entity_types.insert(
-            "ChildTestType".to_string(),
+        loader.schema.add_entity_type(
             EntityTypeDescription {
                 name: "ChildTestType".to_string(),
                 children: vec![],
@@ -724,6 +707,7 @@ mod common {
 mod entity_tests {
 
     use inscenerator_xfs::mockfs;
+    use crate::schema::ChildEntityRules;
 
     use super::common::*;
     use super::*;
@@ -1082,8 +1066,7 @@ mod entity_tests {
 
         let mut loader = EntityLoader::new();
 
-        loader.entity_types.insert(
-            "Project".to_string(),
+        loader.schema.add_entity_type(
             EntityTypeDescription {
                 name: "Project".to_string(),
                 children: vec![
@@ -1103,8 +1086,7 @@ mod entity_tests {
                 allow_additional: false,
             },
         );
-        loader.entity_types.insert(
-            "Chapter".to_string(),
+        loader.schema.add_entity_type(
             EntityTypeDescription {
                 name: "Chapter".to_string(),
                 children: vec![ChildEntityRules {
@@ -1116,16 +1098,14 @@ mod entity_tests {
                 allow_additional: false,
             },
         );
-        loader.entity_types.insert(
-            "Scene".to_string(),
+        loader.schema.add_entity_type(
             EntityTypeDescription {
                 name: "Scene".to_string(),
                 children: vec![],
                 allow_additional: true,
             },
         );
-        loader.entity_types.insert(
-            "Notes".to_string(),
+        loader.schema.add_entity_type(
             EntityTypeDescription {
                 name: "Notes".to_string(),
                 children: vec![ChildEntityRules {
@@ -1458,6 +1438,7 @@ mod entity_tests {
         assert_eq!(file_content, content);
     }
 
+
     #[test]
     fn test_load_entity_with_various_thematic_breaks() {
         let mut fs = mockfs::MockFS::new();
@@ -1583,11 +1564,11 @@ mod entity_tests {
             "foo/parent",
             "child1.meta.toml",
             "type=\"ChildTestType\"\n",
-        );
-        let fs = fs;
+            );
+            let fs = fs;
 
         let mut loader = EntityLoader::new();
-        loader.entity_types.insert(
+        loader.schema.entity_types.insert(
             "TestType".to_string(),
             EntityTypeDescription {
                 name: "TestType".to_string(),
@@ -1600,7 +1581,7 @@ mod entity_tests {
                 allow_additional: false,
             },
         );
-        loader.entity_types.insert(
+        loader.schema.entity_types.insert(
             "ChildTestType".to_string(),
             EntityTypeDescription {
                 name: "ChildTestType".to_string(),
@@ -1625,7 +1606,7 @@ mod entity_tests {
         let fs = fs;
 
         let mut loader = EntityLoader::new();
-        loader.entity_types.insert(
+        loader.schema.entity_types.insert(
             "Project".to_string(),
             EntityTypeDescription {
                 name: "Project".to_string(),
