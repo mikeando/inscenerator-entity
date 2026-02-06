@@ -9,22 +9,30 @@ use inscenerator_xfs::Xfs;
 use crate::entity::{EntityPath, EntityPathEntry, EntityContent, EntityMeta, utils};
 use crate::schema::{Schema};
 
+/// Stubs for missing Xfs functionality.
 pub mod xfs_ext {
     use super::*;
+    /// Stub for removing a file.
     pub fn remove_file(_fs: &mut dyn Xfs, _path: &Path) -> anyhow::Result<()> {
         todo!("remove_file not yet in Xfs trait")
     }
+    /// Stub for removing a directory and all its contents.
     pub fn remove_dir_all(_fs: &mut dyn Xfs, _path: &Path) -> anyhow::Result<()> {
         todo!("remove_dir_all not yet in Xfs trait")
     }
+    /// Stub for renaming a file or directory.
     pub fn rename(_fs: &mut dyn Xfs, _from: &Path, _to: &Path) -> anyhow::Result<()> {
         todo!("rename not yet in Xfs trait")
     }
 }
 
+/// Shared context for a tree of LiveEntities.
 pub struct LiveEntityRoot {
+    /// The underlying filesystem.
     pub fs: Rc<RefCell<dyn Xfs>>,
+    /// The base path on disk for this entity tree.
     pub base_path: PathBuf,
+    /// The schema defining entity types and rules.
     pub schema: Rc<Schema>,
 }
 
@@ -36,14 +44,19 @@ impl fmt::Debug for LiveEntityRoot {
     }
 }
 
+/// A handle to an entity that provides on-demand read and write access to the filesystem.
 #[derive(Clone, Debug)]
 pub struct LiveEntity {
+    /// Shared root context.
     pub root: Rc<LiveEntityRoot>,
+    /// Logical path of the entity.
     pub path: EntityPath,
+    /// Type name of the entity.
     pub node_type: String,
 }
 
 impl LiveEntity {
+    /// Creates a new LiveEntity handle.
     pub fn new(
         fs: Rc<RefCell<dyn Xfs>>,
         base_path: PathBuf,
@@ -62,10 +75,12 @@ impl LiveEntity {
         }
     }
 
+    /// Returns the logical path of this entity.
     pub fn path(&self) -> &EntityPath {
         &self.path
     }
 
+    /// Returns the type name of this entity.
     pub fn node_type(&self) -> &str {
         &self.node_type
     }
@@ -117,6 +132,11 @@ impl LiveEntity {
         Ok((content, false, slash_content_file))
     }
 
+    /// Reads the content of the entity from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if disk access fails or if storage format is inconsistent.
     pub fn content(&self) -> anyhow::Result<EntityContent> {
         let (content_str, is_parallel, _) = self.get_content_info()?;
 
@@ -136,6 +156,11 @@ impl LiveEntity {
         Ok(content)
     }
 
+    /// Reads the metadata of the entity from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if disk access fails or if multiple metadata sources are found.
     pub fn metadata(&self) -> anyhow::Result<EntityMeta> {
         let fs = self.root.fs.borrow();
         let is_root = self.path.entries.is_empty();
@@ -178,6 +203,11 @@ impl LiveEntity {
         Ok(meta_sources.into_iter().next().unwrap_or(EntityMeta::None))
     }
 
+    /// Returns handles to the children of this entity as defined by the schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if disk access fails or if an unexpected child is encountered.
     pub fn children(&self) -> anyhow::Result<Vec<LiveEntity>> {
         let fs = self.root.fs.borrow();
         let is_root = self.path.entries.is_empty();
@@ -223,6 +253,11 @@ impl LiveEntity {
         Ok(loaded_children)
     }
 
+    /// Updates the content of the entity on disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if disk access fails.
     pub fn set_content(&self, new_content: &str) -> anyhow::Result<()> {
         let current_meta = self.metadata()?;
         let (content_str, _is_parallel, path) = self.get_content_info()?;
@@ -260,6 +295,11 @@ impl LiveEntity {
         Ok(())
     }
 
+    /// Updates the metadata of the entity on disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if disk access fails.
     pub fn set_metadata(&self, meta: EntityMeta) -> anyhow::Result<()> {
         let current_meta = self.metadata()?;
         let current_content = self.content()?;
@@ -332,6 +372,14 @@ impl LiveEntity {
         Ok(())
     }
 
+    /// Deletes the entity and its associated files from disk.
+    ///
+    /// If `recursive` is true, all children (both Slash and Dot types) are deleted.
+    /// If `recursive` is false and the entity has children, deletion will fail.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if disk access fails or if entity is not empty and recursive=false.
     pub fn delete(&self, recursive: bool) -> anyhow::Result<()> {
         let mut fs = self.root.fs.borrow_mut();
 
@@ -387,6 +435,11 @@ impl LiveEntity {
         Ok(())
     }
 
+    /// Moves/renames the entity on disk to a new logical path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if disk access fails or if nothing is found to move.
     pub fn move_to(&mut self, new_path: EntityPath) -> anyhow::Result<()> {
         let old_on_disk = self.on_disk_path();
         let new_on_disk = new_path.to_pathbuf(&self.root.base_path);
@@ -467,6 +520,14 @@ impl LiveEntity {
         Ok(())
     }
 
+    /// Creates a new child entity handle.
+    ///
+    /// Note: This does not write anything to disk immediately unless it is a Slash entry,
+    /// in which case the parent directory is created.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if disk access fails.
     pub fn create_child(
         &self,
         entry: EntityPathEntry,
