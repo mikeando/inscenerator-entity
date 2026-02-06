@@ -1219,16 +1219,8 @@ mod entity_tests {
         // Now check that the directory exists and has the content file.
         let de = fs.resolve_path(&PathBuf::from("foo/an_entity")).unwrap();
         let de = de.as_dir().unwrap();
-        assert_eq!(de.entries.len(), 1);
-        let file_content = &fs
-            .resolve_path(&PathBuf::from("foo/an_entity/content.md"))
-            .unwrap()
-            .as_file()
-            .unwrap()
-            .contents;
-        let file_content = std::str::from_utf8(file_content.borrow().as_slice())
-            .unwrap()
-            .to_string();
+        assert_eq!(de.num_entries(), 1);
+        let file_content = fs.get_str(&PathBuf::from("foo/an_entity/content.md")).unwrap();
         assert_eq!(file_content, content);
     }
 
@@ -1251,15 +1243,7 @@ mod entity_tests {
             .write_entity(&mut fs, &PathBuf::from("foo"), &entity)
             .unwrap();
         // Now check that the content file.
-        let file_content = &fs
-            .resolve_path(&PathBuf::from("foo/an_entity.md"))
-            .unwrap()
-            .as_file()
-            .unwrap()
-            .contents;
-        let file_content = std::str::from_utf8(file_content.borrow().as_slice())
-            .unwrap()
-            .to_string();
+        let file_content = fs.get_str(&PathBuf::from("foo/an_entity.md")).unwrap();
         assert_eq!(file_content, content);
     }
 
@@ -1286,16 +1270,8 @@ mod entity_tests {
         // Now check that the directory exists and has the metadata file.
         let de = fs.resolve_path(&PathBuf::from("foo/an_entity")).unwrap();
         let de = de.as_dir().unwrap();
-        assert_eq!(de.entries.len(), 1);
-        let file_metadata = &fs
-            .resolve_path(&PathBuf::from("foo/an_entity/meta.toml"))
-            .unwrap()
-            .as_file()
-            .unwrap()
-            .contents;
-        let file_metadata = std::str::from_utf8(file_metadata.borrow().as_slice())
-            .unwrap()
-            .to_string();
+        assert_eq!(de.num_entries(), 1);
+        let file_metadata = fs.get_str(&PathBuf::from("foo/an_entity/meta.toml")).unwrap();
         assert_eq!(file_metadata, "bar = \"foo\"\n");
     }
 
@@ -1339,36 +1315,20 @@ mod entity_tests {
         // Now check that the directory exists and has the child directories.
         let de = fs.resolve_path(&PathBuf::from("foo/an_entity")).unwrap();
         let de = de.as_dir().unwrap();
-        assert_eq!(de.entries.len(), 2);
+        assert_eq!(de.num_entries(), 2);
         let child1_de = fs
             .resolve_path(&PathBuf::from("foo/an_entity/child1"))
             .unwrap();
         let child1_de = child1_de.as_dir().unwrap();
-        assert_eq!(child1_de.entries.len(), 1);
-        let child1_content = &fs
-            .resolve_path(&PathBuf::from("foo/an_entity/child1/content.md"))
-            .unwrap()
-            .as_file()
-            .unwrap()
-            .contents;
-        let child1_content = std::str::from_utf8(child1_content.borrow().as_slice())
-            .unwrap()
-            .to_string();
+        assert_eq!(child1_de.num_entries(), 1);
+        let child1_content = fs.get_str(&PathBuf::from("foo/an_entity/child1/content.md")).unwrap();
         assert_eq!(child1_content, "Child 1 content");
         let child2_de = fs
             .resolve_path(&PathBuf::from("foo/an_entity/child2"))
             .unwrap();
         let child2_de = child2_de.as_dir().unwrap();
-        assert_eq!(child2_de.entries.len(), 1);
-        let child2_content = &fs
-            .resolve_path(&PathBuf::from("foo/an_entity/child2/content.md"))
-            .unwrap()
-            .as_file()
-            .unwrap()
-            .contents;
-        let child2_content = std::str::from_utf8(child2_content.borrow().as_slice())
-            .unwrap()
-            .to_string();
+        assert_eq!(child2_de.num_entries(), 1);
+        let child2_content = fs.get_str(&PathBuf::from("foo/an_entity/child2/content.md")).unwrap();
         assert_eq!(child2_content, "Child 2 content");
     }
 
@@ -1407,21 +1367,9 @@ mod entity_tests {
         writer
             .write_entity(&mut fs, &PathBuf::from("foo"), &entity)
             .unwrap();
-        let child1_content_file = fs
-            .resolve_path(&PathBuf::from("foo/an_entity.child1.md"))
-            .unwrap();
-        let child1_file = child1_content_file.as_file().unwrap();
-        let child1_content = std::str::from_utf8(child1_file.contents.borrow().as_slice())
-            .unwrap()
-            .to_string();
+        let child1_content = fs.get_str(&PathBuf::from("foo/an_entity.child1.md")).unwrap();
         assert_eq!(child1_content, "Child 1 content");
-        let child2_content_file = fs
-            .resolve_path(&PathBuf::from("foo/an_entity.child2.md"))
-            .unwrap();
-        let child2_file = child2_content_file.as_file().unwrap();
-        let child2_content = std::str::from_utf8(child2_file.contents.borrow().as_slice())
-            .unwrap()
-            .to_string();
+        let child2_content = fs.get_str(&PathBuf::from("foo/an_entity.child2.md")).unwrap();
         assert_eq!(child2_content, "Child 2 content");
     }
 
@@ -1506,14 +1454,7 @@ mod entity_tests {
         assert_eq!(e, e2);
 
         // Verify file content exactly
-        let file_content_raw = &fs
-            .resolve_path(&PathBuf::from("bar/entity1.md"))
-            .unwrap()
-            .as_file()
-            .unwrap()
-            .contents;
-        let binding = file_content_raw.borrow();
-        let file_content = std::str::from_utf8(binding.as_slice()).unwrap();
+        let file_content = fs.get_str(&PathBuf::from("bar/entity1.md")).unwrap();
         assert_eq!(file_content, content);
     }
 
