@@ -91,7 +91,7 @@ impl EntityPathEntry {
     }
 }
 
-pub(crate) mod utils {
+pub mod utils {
     use std::collections::BTreeSet;
 
     use super::*;
@@ -162,7 +162,7 @@ pub(crate) mod utils {
             let de = de?;
             let entry_path = de.path();
             if let Some(full_filename) = entry_path.file_name() {
-                if full_filename == "content.md" || full_filename == "meta.toml" {
+                if full_filename == "content.md" || full_filename == "meta.toml" || full_filename == "schema.toml" {
                     continue;
                 }
             }
