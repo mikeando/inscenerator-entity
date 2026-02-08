@@ -182,4 +182,30 @@ children = []
         assert_eq!(root.children.len(), 1);
         assert_eq!(root.children[0].node_type, "Chapter");
     }
+
+    #[test]
+    fn test_load_schema_and_root_ignores_schema_toml() {
+        let mut fs = mockfs::MockFS::new();
+        let schema_toml = r#"
+[Project]
+allow_additional = true
+[[Project.children]]
+name_regex = "some_child"
+node_type = "Type"
+required = false
+multiple = true
+
+[Type]
+allow_additional = true
+children = []
+"#;
+        create_file_with_content(&mut fs, "project", "schema.toml", schema_toml);
+        create_file_with_content(&mut fs, "project", "meta.toml", "type = \"Project\"");
+        create_file_with_content(&mut fs, "project/some_child", "content.md", "Child content");
+
+        let (_, root) = load_schema_and_root(&fs, &Path::new("project")).unwrap();
+        // Should have 1 child (some_child), but NOT schema.toml
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].path.entries.last().unwrap().to_pathbuf(Path::new("")).to_str().unwrap(), "some_child");
+    }
 }

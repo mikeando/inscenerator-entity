@@ -124,7 +124,7 @@ pub(crate) mod utils {
             };
 
             // We want to skip a couple of special cases
-            if suffix == "md" || suffix == "meta.toml" || suffix == "schema.toml" {
+            if suffix == "md" || suffix == "meta.toml" {
                 continue;
             }
 

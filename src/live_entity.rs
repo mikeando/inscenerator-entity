@@ -789,8 +789,13 @@ mod tests {
         let mut schema = Schema::new();
         schema.add_entity_type(EntityTypeDescription {
             name: "Project".to_string(),
-            children: vec![],
-            allow_additional: false,
+            children: vec![ChildEntityRules {
+                name_regex: ".*".to_string(),
+                node_type: "Type".to_string(),
+                required: false,
+                multiple: true,
+            }],
+            allow_additional: true,
         });
         let schema = Rc::new(schema);
 
@@ -803,6 +808,7 @@ mod tests {
         );
 
         let children = live.children().unwrap();
+        // Should not include schema.toml even with permissive regex and allow_additional
         assert_eq!(children.len(), 0);
     }
 }
