@@ -124,10 +124,7 @@ pub(crate) mod utils {
             };
 
             // We want to skip a couple of special cases
-            if suffix == "md" {
-                continue;
-            }
-            if suffix == "meta.toml" {
+            if suffix == "md" || suffix == "meta.toml" {
                 continue;
             }
 
@@ -162,7 +159,7 @@ pub(crate) mod utils {
             let de = de?;
             let entry_path = de.path();
             if let Some(full_filename) = entry_path.file_name() {
-                if full_filename == "content.md" || full_filename == "meta.toml" {
+                if full_filename == "content.md" || full_filename == "meta.toml" || full_filename == "schema.toml" {
                     continue;
                 }
             }

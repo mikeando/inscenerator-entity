@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 - Schema-driven child entity discovery and type assignment using `EntityTypeDescription`.
 - Comprehensive "Entity Mapping" documentation in README.md.
 - Devcontainer configuration for standardized development environments.
+- Support for loading entity schemas from `schema.toml` files.
 
 ### Changed
 - Updated `EntityLoader` and `EntityWriter` to support the new metadata and type resolution features.

@@ -69,41 +69,63 @@ This library uses `xfs`, a filesystem abstraction crate. This allows you to work
 
 ### Defining Entity Types
 
-You must define the structure of your entities using `EntityTypeDescription` and `ChildEntityRules`. This tells the `EntityLoader` what children to expect and their types.
+You can define the structure of your entities programmatically or by loading a schema from a file. This tells the `EntityLoader` what children to expect and their types.
+
+#### Loading Schema from File
+
+A schema can be defined in a `schema.toml` file at the root of your project:
+
+```toml
+[Project]
+allow_additional = false
+[[Project.children]]
+name_regex = "^[0-9]+_"
+node_type = "Chapter"
+required = false
+multiple = true
+
+[Chapter]
+allow_additional = true
+children = []
+```
+
+You can then load this schema and the root entity using `load_schema_and_root`:
+
+```rust
+use inscenerator_entity::schema::load_schema_and_root;
+use xfs::OsFs;
+use std::path::Path;
+
+let fs = OsFs {};
+let (schema, root) = load_schema_and_root(&fs, Path::new("./my-project")).unwrap();
+```
+
+#### Programmatic Definition
+
+Alternatively, you can build the schema manually:
 
 ```rust
 use inscenerator_entity::entity::{EntityTypeDescription, ChildEntityRules, EntityLoader};
+use inscenerator_entity::schema::Schema;
 
 fn setup_loader() -> EntityLoader {
-    let mut loader = EntityLoader::new();
+    let mut schema = Schema::new();
 
     // Create a rule for children with a specific prefix
-    fn child_entity(node_type: &str) -> ChildEntityRules {
-        ChildEntityRules {
-            name_regex: "^[0-9]+_".to_string(),
-            node_type: node_type.to_string(),
-            required: false,
-            multiple: true,
-        }
-    }
+    let chapter_rule = ChildEntityRules {
+        name_regex: "^[0-9]+_".to_string(),
+        node_type: "Chapter".to_string(),
+        required: false,
+        multiple: true,
+    };
 
-    // Helper to add an entity type to the loader
-    fn add_entity(loader: &mut EntityLoader, name: &str, children: &[ChildEntityRules]) {
-        loader.entity_types.insert(
-            name.to_string(),
-            EntityTypeDescription {
-                name: name.to_string(),
-                children: children.to_vec(),
-                allow_additional: false,
-            },
-        );
-    }
+    schema.add_entity_type(EntityTypeDescription {
+        name: "Project".to_string(),
+        children: vec![chapter_rule],
+        allow_additional: false,
+    });
 
-    add_entity(&mut loader, "Project", &[child_entity("Chapter")]);
-    add_entity(&mut loader, "Chapter", &[child_entity("Scene")]);
-    add_entity(&mut loader, "Scene", &[]);
-
-    loader
+    EntityLoader { schema }
 }
 ```
 
