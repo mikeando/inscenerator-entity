@@ -58,6 +58,23 @@ impl LiveEntity {
         }
     }
 
+    /// Loads a schema from 'schema.toml' in the given directory and returns a root LiveEntity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the schema or root entity cannot be loaded.
+    pub fn load_from_root(fs: Rc<RefCell<dyn Xfs>>, root_path: PathBuf) -> anyhow::Result<Self> {
+        let schema_path = root_path.join("schema.toml");
+        let schema = Rc::new(Schema::load_from_file(&*fs.borrow(), &schema_path)?);
+        Ok(Self::new(
+            fs,
+            root_path,
+            EntityPath::empty(),
+            "Auto".to_string(),
+            schema,
+        ))
+    }
+
     /// Returns the logical path of this entity.
     pub fn path(&self) -> &EntityPath {
         &self.path
@@ -66,6 +83,41 @@ impl LiveEntity {
     /// Returns the type name of this entity.
     pub fn node_type(&self) -> &str {
         &self.node_type
+    }
+
+    /// Returns the actual type name of this entity, resolving "Auto" if necessary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if resolution fails or if metadata is missing/invalid for Auto type.
+    pub fn actual_type(&self) -> anyhow::Result<String> {
+        if self.node_type != "Auto" {
+            return Ok(self.node_type.clone());
+        }
+
+        let meta = self.metadata()?;
+        let m = meta.metadata().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Entity at {:?} has Auto type but no metadata",
+                self.on_disk_path()
+            )
+        })?;
+
+        let t = m.get_str("type")?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Entity at {:?} has Auto type but metadata is missing 'type' key",
+                self.on_disk_path()
+            )
+        })?;
+
+        if t == "Auto" {
+            bail!(
+                "Entity at {:?} has metadata 'type' set to 'Auto', which is not allowed",
+                self.on_disk_path()
+            );
+        }
+
+        Ok(t)
     }
 
     fn on_disk_path(&self) -> PathBuf {
@@ -206,7 +258,8 @@ impl LiveEntity {
             .chain(slash_children)
             .collect::<Vec<EntityPath>>();
 
-        let entity_type_descriptor = self.root.schema.get_entity_type(&self.node_type)?;
+        let actual_type = self.actual_type()?;
+        let entity_type_descriptor = self.root.schema.get_entity_type(&actual_type)?;
 
         let mut loaded_children = vec![];
         for child_path in children_paths {
@@ -699,5 +752,57 @@ mod tests {
 
         let new_path = EntityPath::empty().extend_slash("entity2");
         live.move_to(new_path).unwrap();
+    }
+
+    #[test]
+    fn test_live_entity_auto_type_resolution() {
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "project", "meta.toml", "type = \"Project\"");
+        let fs = Rc::new(RefCell::new(fs));
+
+        let mut schema = Schema::new();
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Project".to_string(),
+            children: vec![],
+            allow_additional: true,
+        });
+        let schema = Rc::new(schema);
+
+        let live = LiveEntity::new(
+            fs,
+            PathBuf::from("project"),
+            EntityPath::empty(),
+            "Auto".to_string(),
+            schema,
+        );
+
+        assert_eq!(live.actual_type().unwrap(), "Project");
+    }
+
+    #[test]
+    fn test_live_entity_ignore_schema_toml() {
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "project", "schema.toml", "");
+        create_file_with_content(&mut fs, "project", "meta.toml", "type = \"Project\"");
+        let fs = Rc::new(RefCell::new(fs));
+
+        let mut schema = Schema::new();
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Project".to_string(),
+            children: vec![],
+            allow_additional: false,
+        });
+        let schema = Rc::new(schema);
+
+        let live = LiveEntity::new(
+            fs,
+            PathBuf::from("project"),
+            EntityPath::empty(),
+            "Project".to_string(),
+            schema,
+        );
+
+        let children = live.children().unwrap();
+        assert_eq!(children.len(), 0);
     }
 }

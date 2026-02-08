@@ -91,7 +91,7 @@ impl EntityPathEntry {
     }
 }
 
-pub mod utils {
+pub(crate) mod utils {
     use std::collections::BTreeSet;
 
     use super::*;
@@ -124,10 +124,7 @@ pub mod utils {
             };
 
             // We want to skip a couple of special cases
-            if suffix == "md" {
-                continue;
-            }
-            if suffix == "meta.toml" {
+            if suffix == "md" || suffix == "meta.toml" || suffix == "schema.toml" {
                 continue;
             }
 
