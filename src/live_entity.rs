@@ -300,7 +300,7 @@ impl LiveEntity {
 
         let mut to_write = String::new();
         if let EntityMeta::InHeader(m, sep, header_type) = current_meta {
-            to_write.push_str(&utils::format_header(&m, header_type, sep.as_deref(), new_content)?);
+            to_write.push_str(&utils::format_metadata_header(&m, header_type, sep.as_deref(), new_content)?);
         }
         to_write.push_str(new_content);
 
@@ -379,7 +379,7 @@ impl LiveEntity {
             }
             EntityMeta::InHeader(m, sep, header_type) => {
                 let content_body = current_content.content().unwrap_or("");
-                let to_write = utils::format_header(&m, header_type, sep.as_deref(), content_body)? + content_body;
+                let to_write = utils::format_metadata_header(&m, header_type, sep.as_deref(), content_body)? + content_body;
 
                 let final_path = if current_content.is_none() {
                      if self.path.entries.is_empty() {

@@ -135,7 +135,7 @@ pub(crate) mod utils {
             toml::Value::Datetime(d) => Yaml::String(d.to_string()),
             toml::Value::Array(a) => Yaml::Array(a.iter().map(toml_to_yaml).collect()),
             toml::Value::Table(t) => {
-                let mut map = linked_hash_map::LinkedHashMap::new();
+                let mut map = yaml_rust::yaml::Hash::new();
                 for (k, v) in t {
                     map.insert(Yaml::String(k.clone()), toml_to_yaml(v));
                 }
@@ -144,7 +144,7 @@ pub(crate) mod utils {
         }
     }
 
-    pub fn format_header(
+    pub fn format_metadata_header(
         metadata: &Metadata,
         header_type: HeaderType,
         sep: Option<&str>,
@@ -282,44 +282,41 @@ pub(crate) mod utils {
         }
     }
 
-    pub fn parse_header(content: &str) -> Option<(Metadata, Option<String>, String, HeaderType)> {
+    pub fn split_out_yaml_front_matter(content: &str) -> Option<(String, String)> {
+        if !content.starts_with("---") {
+            return None;
+        }
+        let mut lines = content.split_inclusive('\n');
+        let first_line = lines.next()?;
+        if first_line.trim_end_matches(['\n', '\r']) != "---" {
+            return None;
+        }
+        let mut inner_yaml = String::new();
+        let mut end_pos = first_line.len();
+        let mut found_end = false;
+        for line in lines {
+            if line.trim_end_matches(['\n', '\r']) == "---" {
+                found_end = true;
+                end_pos += line.len();
+                break;
+            }
+            inner_yaml.push_str(line);
+            end_pos += line.len();
+        }
+
+        if found_end {
+            let actual_content = content[end_pos..].to_string();
+            Some((actual_content, inner_yaml))
+        } else {
+            None
+        }
+    }
+
+    pub fn split_out_toml_front_matter(content: &str) -> Option<(String, String, Option<String>)> {
         let thematic_break_re =
             regex::Regex::new(r"^[ ]{0,3}(?:(?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\*[ \t]*){3,})[ \t]*$")
                 .unwrap();
 
-        // 1. Try YAML frontmatter (must be first line)
-        if content.starts_with("---") {
-            let mut lines = content.split_inclusive('\n');
-            if let Some(first_line) = lines.next() {
-                if first_line.trim_end_matches(['\n', '\r']) == "---" {
-                    let mut inner_yaml = String::new();
-                    let mut end_pos = first_line.len();
-                    let mut found_end = false;
-                    for line in lines {
-                        if line.trim_end_matches(['\n', '\r']) == "---" {
-                            found_end = true;
-                            end_pos += line.len();
-                            break;
-                        }
-                        inner_yaml.push_str(line);
-                        end_pos += line.len();
-                    }
-
-                    if found_end {
-                        let docs = yaml_rust::YamlLoader::load_from_str(&inner_yaml).ok()?;
-                        if !docs.is_empty() {
-                            let metadata = Metadata {
-                                value: yaml_to_toml(&docs[0]),
-                            };
-                            let actual_content = content[end_pos..].to_string();
-                            return Some((metadata, None, actual_content, HeaderType::Yaml));
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. Find the opening ```
         let mut start_pos = 0;
         let mut lines_iter = content.split_inclusive('\n');
         let mut found_start = false;
@@ -342,7 +339,6 @@ pub(crate) mod utils {
             return None;
         }
 
-        // 3. Find the closing ```
         let mut end_pos = start_pos;
         let mut found_end = false;
         let mut inner_toml = String::new();
@@ -360,12 +356,9 @@ pub(crate) mod utils {
         }
 
         // remove the trailing newline from inner_toml if present
-        let inner_toml_trimmed = inner_toml.trim_end_matches(['\n', '\r']);
+        let inner_toml_trimmed = inner_toml.trim_end_matches(['\n', '\r']).to_string();
 
-        let value: toml::Value = toml::from_str(inner_toml_trimmed).ok()?;
-        let metadata = Metadata { value };
-
-        // 4. Find optional separator
+        // Find optional separator
         let mut separator: Option<String> = None;
         let mut content_start_pos = end_pos;
 
@@ -380,15 +373,33 @@ pub(crate) mod utils {
                 break;
             }
             if !line.trim().is_empty() {
-                // Not a thematic break and not empty -> end of gap, no separator found
                 break;
             }
             current_gap.push_str(line);
         }
 
         let actual_content = content[content_start_pos..].to_string();
+        Some((actual_content, inner_toml_trimmed, separator))
+    }
 
-        Some((metadata, separator, actual_content, HeaderType::Toml))
+    pub fn parse_header(content: &str) -> Option<(Metadata, Option<String>, String, HeaderType)> {
+        if let Some((actual_content, inner_yaml)) = split_out_yaml_front_matter(content) {
+            let docs = yaml_rust::YamlLoader::load_from_str(&inner_yaml).ok()?;
+            if !docs.is_empty() {
+                let metadata = Metadata {
+                    value: yaml_to_toml(&docs[0]),
+                };
+                return Some((metadata, None, actual_content, HeaderType::Yaml));
+            }
+        }
+
+        if let Some((actual_content, inner_toml, separator)) = split_out_toml_front_matter(content) {
+            let value: toml::Value = toml::from_str(&inner_toml).ok()?;
+            let metadata = Metadata { value };
+            return Some((metadata, separator, actual_content, HeaderType::Toml));
+        }
+
+        None
     }
 }
 
@@ -656,7 +667,7 @@ impl EntityWriter {
         if let Some(content) = entity.content.content() {
             let mut to_write = String::new();
             if let EntityMeta::InHeader(m, sep, header_type) = &entity.metadata {
-                to_write.push_str(&utils::format_header(m, *header_type, sep.as_deref(), content)?);
+                to_write.push_str(&utils::format_metadata_header(m, *header_type, sep.as_deref(), content)?);
             }
             to_write.push_str(content);
 
