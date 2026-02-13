@@ -177,7 +177,7 @@ impl LiveEntity {
 
         let content = if let Some(c) = content_str {
             let (_, a) = utils::parse_header(&c)
-                .map(|(m, s, a)| (Some(EntityMeta::InHeader(m, s)), a))
+                .map(|(m, s, a, h)| (Some(EntityMeta::InHeader(m, s, h)), a))
                 .unwrap_or((None, c));
             if is_parallel {
                 EntityContent::Parallel(a)
@@ -203,7 +203,7 @@ impl LiveEntity {
         let (content_str, _, _) = self.get_content_info()?;
 
         let metadata_from_content = content_str.and_then(|c| {
-            utils::parse_header(&c).map(|(m, s, _)| EntityMeta::InHeader(m, s))
+            utils::parse_header(&c).map(|(m, s, _, h)| EntityMeta::InHeader(m, s, h))
         });
 
         // 2. Try loading from meta.toml files
@@ -299,15 +299,8 @@ impl LiveEntity {
         let (content_str, _is_parallel, path) = self.get_content_info()?;
 
         let mut to_write = String::new();
-        if let EntityMeta::InHeader(m, sep) = current_meta {
-            to_write.push_str("```toml\n");
-            to_write.push_str(&toml::to_string(&m.value)?);
-            to_write.push_str("```\n");
-            if let Some(s) = sep {
-                to_write.push_str(&s);
-            } else if !new_content.starts_with('\n') {
-                to_write.push_str("\n");
-            }
+        if let EntityMeta::InHeader(m, sep, header_type) = current_meta {
+            to_write.push_str(&utils::format_header(&m, header_type, sep.as_deref(), new_content)?);
         }
         to_write.push_str(new_content);
 
@@ -326,6 +319,9 @@ impl LiveEntity {
         if let Some(parent) = final_path.parent() {
             fs.create_dir_all(parent)?;
         }
+        if fs.is_file(&final_path) {
+            let _ = fs.remove_file(&final_path);
+        }
         let mut writer = fs.writer(&final_path)?;
         writer.write_all(to_write.as_bytes())?;
         Ok(())
@@ -339,15 +335,21 @@ impl LiveEntity {
     pub fn set_metadata(&self, meta: EntityMeta) -> anyhow::Result<()> {
         let current_meta = self.metadata()?;
         let current_content = self.content()?;
+        let (content_str, _, content_path) = self.get_content_info()?;
 
         let mut fs = self.root.fs.borrow_mut();
 
-        if let EntityMeta::InHeader(_, _) = current_meta {
-            if !matches!(meta, EntityMeta::InHeader(_, _)) {
-                let (content_str, _, path) = self.get_content_info()?;
-                if let Some(c) = content_str {
-                     let (_, _, a): (_, _, String) = utils::parse_header(&c).unwrap();
-                     let mut writer = fs.writer(&path)?;
+        if let EntityMeta::InHeader(_, _, _) = current_meta {
+            if !matches!(meta, EntityMeta::InHeader(_, _, _)) {
+                if let Some(c) = &content_str {
+                     let a = match utils::parse_header(&c) {
+                         Some((_, _, a, _)) => a,
+                         None => c.clone(),
+                     };
+                     if fs.is_file(&content_path) {
+                         let _ = fs.remove_file(&content_path);
+                     }
+                     let mut writer = fs.writer(&content_path)?;
                      writer.write_all(a.as_bytes())?;
                 }
             }
@@ -375,20 +377,10 @@ impl LiveEntity {
                 fs.create_dir_all(path.parent().unwrap())?;
                 fs.writer(&path)?.write_all(toml_str.as_bytes())?;
             }
-            EntityMeta::InHeader(m, sep) => {
+            EntityMeta::InHeader(m, sep, header_type) => {
                 let content_body = current_content.content().unwrap_or("");
-                let mut to_write = String::new();
-                to_write.push_str("```toml\n");
-                to_write.push_str(&toml::to_string(&m.value)?);
-                to_write.push_str("```\n");
-                if let Some(s) = sep {
-                    to_write.push_str(&s);
-                } else if !content_body.starts_with('\n') {
-                    to_write.push_str("\n");
-                }
-                to_write.push_str(content_body);
+                let to_write = utils::format_header(&m, header_type, sep.as_deref(), content_body)? + content_body;
 
-                let (_, _, path) = self.get_content_info()?;
                 let final_path = if current_content.is_none() {
                      if self.path.entries.is_empty() {
                          self.slash_content_path()
@@ -396,11 +388,14 @@ impl LiveEntity {
                          self.dot_content_path()
                      }
                 } else {
-                    path
+                    content_path
                 };
 
                 if let Some(parent) = final_path.parent() {
                     fs.create_dir_all(parent)?;
+                }
+                if fs.is_file(&final_path) {
+                    let _ = fs.remove_file(&final_path);
                 }
                 fs.writer(&final_path)?.write_all(to_write.as_bytes())?;
             }
@@ -621,6 +616,31 @@ mod tests {
     }
 
     #[test]
+    fn test_live_entity_yaml_write() {
+        let fs = mockfs::MockFS::new();
+        let fs = Rc::new(RefCell::new(fs));
+        let schema = setup_schema();
+
+        let live = LiveEntity::new(
+            fs.clone(),
+            PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("entity1"),
+            "Type".to_string(),
+            schema,
+        );
+
+        let mut meta_val = toml::map::Map::new();
+        meta_val.insert("key".to_string(), toml::Value::String("val".to_string()));
+        let meta = crate::entity::Metadata { value: toml::Value::Table(meta_val) };
+
+        live.set_metadata(EntityMeta::InHeader(meta, None, HeaderType::Yaml)).unwrap();
+        live.set_content("Hello").unwrap();
+
+        let content = crate::entity::utils::try_load_file_as_string(&*live.root.fs.borrow(), &PathBuf::from("foo/entity1.md")).unwrap().unwrap();
+        assert!(content.contains("---\nkey: val\n---\n"));
+    }
+
+    #[test]
     fn test_live_entity_read() {
         let mut fs = mockfs::MockFS::new();
         create_file_with_content(&mut fs, "foo/entity1", "content.md", "```toml\nkey = \"val\"\n```\n---\nHello");
@@ -638,7 +658,7 @@ mod tests {
 
         assert_eq!(live.content().unwrap(), EntityContent::inside("Hello"));
         let meta = live.metadata().unwrap();
-        if let EntityMeta::InHeader(m, sep) = meta {
+        if let EntityMeta::InHeader(m, sep, _) = meta {
             assert_eq!(m.value.get("key").unwrap().as_str().unwrap(), "val");
             assert_eq!(sep.unwrap(), "---\n");
         } else {
