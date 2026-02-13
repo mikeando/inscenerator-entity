@@ -583,6 +583,7 @@ impl LiveEntity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entity::HeaderType;
     use inscenerator_xfs::mockfs;
     use crate::schema::ChildEntityRules;
     use crate::schema::EntityTypeDescription;
