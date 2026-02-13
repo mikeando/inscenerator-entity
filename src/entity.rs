@@ -288,14 +288,14 @@ pub(crate) mod utils {
         }
         let mut lines = content.split_inclusive('\n');
         let first_line = lines.next()?;
-        if first_line.trim_end_matches(['\n', '\r']) != "---" {
+        if first_line.trim_end_matches(['\n', '\r', ' ', '\t']) != "---" {
             return None;
         }
         let mut inner_yaml = String::new();
         let mut end_pos = first_line.len();
         let mut found_end = false;
         for line in lines {
-            if line.trim_end_matches(['\n', '\r']) == "---" {
+            if line.trim_end_matches(['\n', '\r', ' ', '\t']) == "---" {
                 found_end = true;
                 end_pos += line.len();
                 break;
@@ -1556,6 +1556,19 @@ mod entity_tests {
         if let EntityMeta::InHeader(m, sep, h) = &e.metadata {
             assert_eq!(m.value.get("foo").unwrap().as_str().unwrap(), "bar");
             assert_eq!(sep.as_ref(), None);
+            assert_eq!(*h, HeaderType::Yaml);
+        } else {
+            panic!("Expected InHeader metadata, got {:?}", e.metadata);
+        }
+    }
+
+    #[test]
+    fn test_load_entity_with_yaml_header_trailing_spaces() {
+        let content = "---  \nfoo: bar\n--- \t\n\nActual content";
+        let (e, _) = setup_and_load(content);
+        assert_eq!(e.content, EntityContent::parallel("\nActual content"));
+        if let EntityMeta::InHeader(m, _, h) = &e.metadata {
+            assert_eq!(m.value.get("foo").unwrap().as_str().unwrap(), "bar");
             assert_eq!(*h, HeaderType::Yaml);
         } else {
             panic!("Expected InHeader metadata, got {:?}", e.metadata);
