@@ -647,6 +647,15 @@ impl EntityMeta {
         }
     }
 
+    pub fn metadata_mut(&mut self) -> Option<&mut Metadata> {
+        match self {
+            EntityMeta::None => None,
+            EntityMeta::Parallel(m) => Some(m),
+            EntityMeta::Inside(m) => Some(m),
+            EntityMeta::InHeader(m, _) => Some(m),
+        }
+    }
+
     pub fn parallel(m: Metadata) -> EntityMeta {
         EntityMeta::Parallel(m)
     }
