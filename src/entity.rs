@@ -93,8 +93,92 @@ impl EntityPathEntry {
 
 pub(crate) mod utils {
     use std::collections::BTreeSet;
+    use yaml_rust::Yaml;
 
     use super::*;
+
+    pub fn yaml_to_toml(yaml: &Yaml) -> toml::Value {
+        match yaml {
+            Yaml::Real(s) => {
+                if let Ok(f) = s.parse::<f64>() {
+                    toml::Value::Float(f)
+                } else {
+                    toml::Value::String(s.clone())
+                }
+            }
+            Yaml::Integer(i) => toml::Value::Integer(*i),
+            Yaml::String(s) => toml::Value::String(s.clone()),
+            Yaml::Boolean(b) => toml::Value::Boolean(*b),
+            Yaml::Array(a) => toml::Value::Array(a.iter().map(yaml_to_toml).collect()),
+            Yaml::Hash(h) => {
+                let mut map = toml::map::Map::new();
+                for (k, v) in h {
+                    let key = match k {
+                        Yaml::String(s) => s.clone(),
+                        _ => format!("{:?}", k),
+                    };
+                    map.insert(key, yaml_to_toml(v));
+                }
+                toml::Value::Table(map)
+            }
+            Yaml::Null => toml::Value::String("null".to_string()),
+            _ => toml::Value::String(format!("{:?}", yaml)),
+        }
+    }
+
+    pub fn toml_to_yaml(toml: &toml::Value) -> Yaml {
+        match toml {
+            toml::Value::String(s) => Yaml::String(s.clone()),
+            toml::Value::Integer(i) => Yaml::Integer(*i),
+            toml::Value::Float(f) => Yaml::Real(f.to_string()),
+            toml::Value::Boolean(b) => Yaml::Boolean(*b),
+            toml::Value::Datetime(d) => Yaml::String(d.to_string()),
+            toml::Value::Array(a) => Yaml::Array(a.iter().map(toml_to_yaml).collect()),
+            toml::Value::Table(t) => {
+                let mut map = yaml_rust::yaml::Hash::new();
+                for (k, v) in t {
+                    map.insert(Yaml::String(k.clone()), toml_to_yaml(v));
+                }
+                Yaml::Hash(map)
+            }
+        }
+    }
+
+    pub fn format_metadata_header(
+        metadata: &Metadata,
+        header_type: HeaderType,
+        sep: Option<&str>,
+        content_body: &str,
+    ) -> anyhow::Result<String> {
+        let mut to_write = String::new();
+        match header_type {
+            HeaderType::Toml => {
+                to_write.push_str("```toml\n");
+                to_write.push_str(&toml::to_string(&metadata.value)?);
+                to_write.push_str("```\n");
+            }
+            HeaderType::Yaml => {
+                let yaml = toml_to_yaml(&metadata.value);
+                let mut out_str = String::new();
+                {
+                    let mut emitter = yaml_rust::YamlEmitter::new(&mut out_str);
+                    emitter.dump(&yaml).unwrap();
+                }
+                to_write.push_str(&out_str);
+                if !out_str.ends_with('\n') {
+                    to_write.push_str("\n");
+                }
+                to_write.push_str("---\n");
+            }
+        }
+        if let Some(s) = sep {
+            to_write.push_str(s);
+        } else if !content_body.starts_with('\n') {
+            to_write.push_str("\n");
+        }
+        Ok(to_write)
+    }
+
     pub fn find_dot_children(
         fs: &dyn Xfs,
         base_path: &Path,
@@ -198,12 +282,41 @@ pub(crate) mod utils {
         }
     }
 
-    pub fn parse_header(content: &str) -> Option<(Metadata, Option<String>, String)> {
+    pub fn split_out_yaml_front_matter(content: &str) -> Option<(String, String)> {
+        if !content.starts_with("---") {
+            return None;
+        }
+        let mut lines = content.split_inclusive('\n');
+        let first_line = lines.next()?;
+        if first_line.trim_end_matches(['\n', '\r', ' ', '\t']) != "---" {
+            return None;
+        }
+        let mut inner_yaml = String::new();
+        let mut end_pos = first_line.len();
+        let mut found_end = false;
+        for line in lines {
+            if line.trim_end_matches(['\n', '\r', ' ', '\t']) == "---" {
+                found_end = true;
+                end_pos += line.len();
+                break;
+            }
+            inner_yaml.push_str(line);
+            end_pos += line.len();
+        }
+
+        if found_end {
+            let actual_content = content[end_pos..].to_string();
+            Some((actual_content, inner_yaml))
+        } else {
+            None
+        }
+    }
+
+    pub fn split_out_toml_front_matter(content: &str) -> Option<(String, String, Option<String>)> {
         let thematic_break_re =
             regex::Regex::new(r"^[ ]{0,3}(?:(?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\*[ \t]*){3,})[ \t]*$")
                 .unwrap();
 
-        // 1. Find the opening ```
         let mut start_pos = 0;
         let mut lines_iter = content.split_inclusive('\n');
         let mut found_start = false;
@@ -226,7 +339,6 @@ pub(crate) mod utils {
             return None;
         }
 
-        // 2. Find the closing ```
         let mut end_pos = start_pos;
         let mut found_end = false;
         let mut inner_toml = String::new();
@@ -244,12 +356,9 @@ pub(crate) mod utils {
         }
 
         // remove the trailing newline from inner_toml if present
-        let inner_toml_trimmed = inner_toml.trim_end_matches(['\n', '\r']);
+        let inner_toml_trimmed = inner_toml.trim_end_matches(['\n', '\r']).to_string();
 
-        let value: toml::Value = toml::from_str(inner_toml_trimmed).ok()?;
-        let metadata = Metadata { value };
-
-        // 3. Find optional separator
+        // Find optional separator
         let mut separator: Option<String> = None;
         let mut content_start_pos = end_pos;
 
@@ -264,15 +373,33 @@ pub(crate) mod utils {
                 break;
             }
             if !line.trim().is_empty() {
-                // Not a thematic break and not empty -> end of gap, no separator found
                 break;
             }
             current_gap.push_str(line);
         }
 
         let actual_content = content[content_start_pos..].to_string();
+        Some((actual_content, inner_toml_trimmed, separator))
+    }
 
-        Some((metadata, separator, actual_content))
+    pub fn parse_header(content: &str) -> Option<(Metadata, Option<String>, String, HeaderType)> {
+        if let Some((actual_content, inner_yaml)) = split_out_yaml_front_matter(content) {
+            let docs = yaml_rust::YamlLoader::load_from_str(&inner_yaml).ok()?;
+            if !docs.is_empty() {
+                let metadata = Metadata {
+                    value: yaml_to_toml(&docs[0]),
+                };
+                return Some((metadata, None, actual_content, HeaderType::Yaml));
+            }
+        }
+
+        if let Some((actual_content, inner_toml, separator)) = split_out_toml_front_matter(content) {
+            let value: toml::Value = toml::from_str(&inner_toml).ok()?;
+            let metadata = Metadata { value };
+            return Some((metadata, separator, actual_content, HeaderType::Toml));
+        }
+
+        None
     }
 }
 
@@ -372,7 +499,7 @@ impl EntityLoader {
 
         let (content, metadata_from_content) = if let Some(c) = content_str {
             let (m, a) = utils::parse_header(&c)
-                .map(|(m, s, a)| (Some(EntityMeta::InHeader(m, s)), a))
+                .map(|(m, s, a, h)| (Some(EntityMeta::InHeader(m, s, h)), a))
                 .unwrap_or((None, c));
             if is_parallel {
                 (EntityContent::Parallel(a), m)
@@ -539,15 +666,8 @@ impl EntityWriter {
 
         if let Some(content) = entity.content.content() {
             let mut to_write = String::new();
-            if let EntityMeta::InHeader(m, sep) = &entity.metadata {
-                to_write.push_str("```toml\n");
-                to_write.push_str(&toml::to_string(&m.value)?);
-                to_write.push_str("```\n");
-                if let Some(s) = sep {
-                    to_write.push_str(s);
-                } else if !content.starts_with('\n') {
-                    to_write.push_str("\n");
-                }
+            if let EntityMeta::InHeader(m, sep, header_type) = &entity.metadata {
+                to_write.push_str(&utils::format_metadata_header(m, *header_type, sep.as_deref(), content)?);
             }
             to_write.push_str(content);
 
@@ -557,7 +677,7 @@ impl EntityWriter {
                 _ => unreachable!(),
             };
             fs.writer(&path)?.write_all(to_write.as_bytes())?;
-        } else if let EntityMeta::InHeader(_, _) = &entity.metadata {
+        } else if let EntityMeta::InHeader(_, _, _) = &entity.metadata {
             bail!(
                 "Metadata from header requires content for entity at {:?}",
                 entity.path.to_pathbuf(base_path)
@@ -576,7 +696,7 @@ impl EntityWriter {
                 fs.writer(&entity_path.join("meta.toml"))?
                     .write_all(toml_str.as_bytes())?;
             }
-            EntityMeta::None | EntityMeta::InHeader(_, _) => {}
+            EntityMeta::None | EntityMeta::InHeader(_, _, _) => {}
         }
 
         for child in &entity.children {
@@ -622,6 +742,12 @@ impl EntityContent {
     }
 }
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum HeaderType {
+    Toml,
+    Yaml,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum EntityMeta {
     None,
@@ -630,7 +756,7 @@ pub enum EntityMeta {
     /// metadata is found at entity/meta.toml
     Inside(Metadata),
     /// metadata is found in the content file
-    InHeader(Metadata, Option<String>),
+    InHeader(Metadata, Option<String>, HeaderType),
 }
 
 impl EntityMeta {
@@ -643,7 +769,7 @@ impl EntityMeta {
             EntityMeta::None => None,
             EntityMeta::Parallel(m) => Some(m),
             EntityMeta::Inside(m) => Some(m),
-            EntityMeta::InHeader(m, _) => Some(m),
+            EntityMeta::InHeader(m, _, _) => Some(m),
         }
     }
 
@@ -652,7 +778,7 @@ impl EntityMeta {
             EntityMeta::None => None,
             EntityMeta::Parallel(m) => Some(m),
             EntityMeta::Inside(m) => Some(m),
-            EntityMeta::InHeader(m, _) => Some(m),
+            EntityMeta::InHeader(m, _, _) => Some(m),
         }
     }
 
@@ -1380,7 +1506,7 @@ mod entity_tests {
         expected_val: &str,
         expected_sep: Option<&str>,
     ) {
-        if let EntityMeta::InHeader(m, sep) = meta {
+        if let EntityMeta::InHeader(m, sep, _) = meta {
             assert_eq!(m.value.get(key).unwrap().as_str().unwrap(), expected_val);
             assert_eq!(sep.as_deref(), expected_sep);
         } else {
@@ -1422,6 +1548,33 @@ mod entity_tests {
     }
 
     #[test]
+    fn test_load_entity_with_yaml_header() {
+        let content = "---\nfoo: bar\n---\n\nActual content";
+        let (e, _) = setup_and_load(content);
+        assert_eq!(e.content, EntityContent::parallel("\nActual content"));
+        if let EntityMeta::InHeader(m, sep, h) = &e.metadata {
+            assert_eq!(m.value.get("foo").unwrap().as_str().unwrap(), "bar");
+            assert_eq!(sep.as_ref(), None);
+            assert_eq!(*h, HeaderType::Yaml);
+        } else {
+            panic!("Expected InHeader metadata, got {:?}", e.metadata);
+        }
+    }
+
+    #[test]
+    fn test_load_entity_with_yaml_header_trailing_spaces() {
+        let content = "---  \nfoo: bar\n--- \t\n\nActual content";
+        let (e, _) = setup_and_load(content);
+        assert_eq!(e.content, EntityContent::parallel("\nActual content"));
+        if let EntityMeta::InHeader(m, _, h) = &e.metadata {
+            assert_eq!(m.value.get("foo").unwrap().as_str().unwrap(), "bar");
+            assert_eq!(*h, HeaderType::Yaml);
+        } else {
+            panic!("Expected InHeader metadata, got {:?}", e.metadata);
+        }
+    }
+
+    #[test]
     fn test_round_trip_with_header() {
         let content = "```toml\nfoo = \"bar\"\n```\n\n---\n\nActual content";
 
@@ -1444,6 +1597,25 @@ mod entity_tests {
         assert_eq!(file_content, content);
     }
 
+
+    #[test]
+    fn test_round_trip_with_yaml_header() {
+        let content = "---\nfoo: bar\n---\n\nActual content";
+
+        // 1. Load
+        let (e, mut fs) = setup_and_load(content);
+
+        // 2. Write to a new location
+        fs.create_dir_all(&PathBuf::from("bar")).unwrap();
+        let writer = EntityWriter {};
+        writer
+            .write_entity(&mut fs, &PathBuf::from("bar"), &e)
+            .unwrap();
+
+        // 3. Load from new location and verify
+        let e2 = load_entity(&fs, "bar", "entity1");
+        assert_eq!(e, e2);
+    }
 
     #[test]
     fn test_load_entity_with_various_thematic_breaks() {
