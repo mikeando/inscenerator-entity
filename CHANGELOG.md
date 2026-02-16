@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.1.5
+- Added `Entity::metadata_mut()`
+- Allow YAML front-matter as metadata source. 
+
 ## v0.1.4
 - Entity schemas cab ne loaded from from `schema.toml` files.
 - Support for new "Live" style entities, that allow immediate read-write.
