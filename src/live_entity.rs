@@ -1,6 +1,5 @@
 use std::path::PathBuf;
-use std::rc::Rc;
-use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 use std::fmt;
 
 use anyhow::{bail};
@@ -12,11 +11,11 @@ use crate::schema::{Schema};
 /// Shared context for a tree of LiveEntities.
 pub struct LiveEntityRoot {
     /// The underlying filesystem.
-    pub fs: Rc<RefCell<dyn Xfs>>,
+    pub fs: Arc<Mutex<dyn Xfs + Send + Sync>>,
     /// The base path on disk for this entity tree.
     pub base_path: PathBuf,
     /// The schema defining entity types and rules.
-    pub schema: Rc<Schema>,
+    pub schema: Arc<Schema>,
 }
 
 impl fmt::Debug for LiveEntityRoot {
@@ -31,7 +30,7 @@ impl fmt::Debug for LiveEntityRoot {
 #[derive(Clone, Debug)]
 pub struct LiveEntity {
     /// Shared root context.
-    pub root: Rc<LiveEntityRoot>,
+    pub root: Arc<LiveEntityRoot>,
     /// Logical path of the entity.
     pub path: EntityPath,
     /// Type name of the entity.
@@ -41,14 +40,14 @@ pub struct LiveEntity {
 impl LiveEntity {
     /// Creates a new LiveEntity handle.
     pub fn new(
-        fs: Rc<RefCell<dyn Xfs>>,
+        fs: Arc<Mutex<dyn Xfs + Send + Sync>>,
         base_path: PathBuf,
         path: EntityPath,
         node_type: String,
-        schema: Rc<Schema>,
+        schema: Arc<Schema>,
     ) -> Self {
         Self {
-            root: Rc::new(LiveEntityRoot {
+            root: Arc::new(LiveEntityRoot {
                 fs,
                 base_path,
                 schema,
@@ -63,9 +62,9 @@ impl LiveEntity {
     /// # Errors
     ///
     /// Returns an error if the schema or root entity cannot be loaded.
-    pub fn load_from_root(fs: Rc<RefCell<dyn Xfs>>, root_path: PathBuf) -> anyhow::Result<Self> {
+    pub fn load_from_root(fs: Arc<Mutex<dyn Xfs + Send + Sync>>, root_path: PathBuf) -> anyhow::Result<Self> {
         let schema_path = root_path.join("schema.toml");
-        let schema = Rc::new(Schema::load_from_file(&*fs.borrow(), &schema_path)?);
+        let schema = Arc::new(Schema::load_from_file(&*fs.lock().unwrap(), &schema_path)?);
         Ok(Self::new(
             fs,
             root_path,
@@ -141,7 +140,7 @@ impl LiveEntity {
     }
 
     fn get_content_info(&self) -> anyhow::Result<(Option<String>, bool, PathBuf)> {
-        let fs = self.root.fs.borrow();
+        let fs = self.root.fs.lock().unwrap();
         let is_root = self.path.entries.is_empty();
 
         let dot_content_file = self.dot_content_path();
@@ -197,9 +196,9 @@ impl LiveEntity {
     ///
     /// Returns an error if disk access fails or if multiple metadata sources are found.
     pub fn metadata(&self) -> anyhow::Result<EntityMeta> {
-        let fs = self.root.fs.borrow();
         let is_root = self.path.entries.is_empty();
 
+        // Read content info first (acquires and releases lock internally).
         let (content_str, _, _) = self.get_content_info()?;
 
         let metadata_from_content = content_str.and_then(|c| {
@@ -210,12 +209,14 @@ impl LiveEntity {
         let dot_metadata_file = self.dot_metadata_path();
         let slash_metadata_file = self.slash_metadata_path();
 
+        let fs = self.root.fs.lock().unwrap();
         let dot_metadata = if !is_root {
             utils::try_load_file_as_metadata(&*fs, &dot_metadata_file)?
         } else {
             None
         };
         let slash_metadata = utils::try_load_file_as_metadata(&*fs, &slash_metadata_file)?;
+        drop(fs);
 
         let mut meta_sources = Vec::new();
         if let Some(m) = dot_metadata {
@@ -244,19 +245,22 @@ impl LiveEntity {
     ///
     /// Returns an error if disk access fails or if an unexpected child is encountered.
     pub fn children(&self) -> anyhow::Result<Vec<LiveEntity>> {
-        let fs = self.root.fs.borrow();
         let is_root = self.path.entries.is_empty();
 
-        let dot_children = if !is_root {
-            utils::find_dot_children(&*fs, &self.root.base_path, &self.path)?
-        } else {
-            vec![]
-        };
-        let slash_children = utils::find_slash_children(&*fs, &self.root.base_path, &self.path)?;
-        let children_paths = dot_children
-            .into_iter()
-            .chain(slash_children)
-            .collect::<Vec<EntityPath>>();
+        // Collect child paths with the lock held, then release before calling actual_type().
+        let children_paths = {
+            let fs = self.root.fs.lock().unwrap();
+            let dot_children = if !is_root {
+                utils::find_dot_children(&*fs, &self.root.base_path, &self.path)?
+            } else {
+                vec![]
+            };
+            let slash_children = utils::find_slash_children(&*fs, &self.root.base_path, &self.path)?;
+            dot_children
+                .into_iter()
+                .chain(slash_children)
+                .collect::<Vec<EntityPath>>()
+        }; // lock released here
 
         let actual_type = self.actual_type()?;
         let entity_type_descriptor = self.root.schema.get_entity_type(&actual_type)?;
@@ -305,17 +309,18 @@ impl LiveEntity {
         to_write.push_str(new_content);
 
         let final_path = if content_str.is_none() {
-             let fs = self.root.fs.borrow();
-             if self.path.entries.is_empty() || fs.is_dir(&self.on_disk_path()) {
+            let fs = self.root.fs.lock().unwrap();
+            if self.path.entries.is_empty() || fs.is_dir(&self.on_disk_path()) {
                 self.slash_content_path()
-             } else {
+            } else {
                 self.dot_content_path()
-             }
+            }
+            // fs dropped here
         } else {
             path
         };
 
-        let mut fs = self.root.fs.borrow_mut();
+        let mut fs = self.root.fs.lock().unwrap();
         if let Some(parent) = final_path.parent() {
             fs.create_dir_all(parent)?;
         }
@@ -334,7 +339,7 @@ impl LiveEntity {
         let current_content = self.content()?;
         let (content_str, _, content_path) = self.get_content_info()?;
 
-        let mut fs = self.root.fs.borrow_mut();
+        let mut fs = self.root.fs.lock().unwrap();
 
         if let EntityMeta::InHeader(_, _, _) = current_meta {
             if !matches!(meta, EntityMeta::InHeader(_, _, _)) {
@@ -403,7 +408,7 @@ impl LiveEntity {
     ///
     /// Returns an error if disk access fails or if entity is not empty and recursive=false.
     pub fn delete(&self, recursive: bool) -> anyhow::Result<()> {
-        let mut fs = self.root.fs.borrow_mut();
+        let mut fs = self.root.fs.lock().unwrap();
 
         if !recursive {
             let children = utils::find_dot_children(&*fs, &self.root.base_path, &self.path)?;
@@ -466,7 +471,7 @@ impl LiveEntity {
         let old_on_disk = self.on_disk_path();
         let new_on_disk = new_path.to_pathbuf(&self.root.base_path);
 
-        let mut fs = self.root.fs.borrow_mut();
+        let mut fs = self.root.fs.lock().unwrap();
 
         let mut moved_anything = false;
 
@@ -563,7 +568,7 @@ impl LiveEntity {
         };
 
         if let EntityPathEntry::Slash(_) = entry {
-            let mut fs = self.root.fs.borrow_mut();
+            let mut fs = self.root.fs.lock().unwrap();
             fs.create_dir_all(&self.on_disk_path())?;
         }
 
@@ -579,6 +584,7 @@ mod tests {
     use crate::schema::ChildEntityRules;
     use crate::schema::EntityTypeDescription;
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
     fn create_file_with_content<P: Into<PathBuf>, F: AsRef<Path>>(
         fs: &mut mockfs::MockFS,
@@ -592,7 +598,7 @@ mod tests {
             .unwrap();
     }
 
-    fn setup_schema() -> Rc<Schema> {
+    fn setup_schema() -> Arc<Schema> {
         let mut schema = Schema::new();
         schema.add_entity_type(EntityTypeDescription {
             name: "Type".to_string(),
@@ -604,13 +610,13 @@ mod tests {
             }],
             allow_additional: true,
         });
-        Rc::new(schema)
+        Arc::new(schema)
     }
 
     #[test]
     fn test_live_entity_yaml_write() {
         let fs = mockfs::MockFS::new();
-        let fs = Rc::new(RefCell::new(fs));
+        let fs = Arc::new(Mutex::new(fs));
         let schema = setup_schema();
 
         let live = LiveEntity::new(
@@ -628,7 +634,7 @@ mod tests {
         live.set_metadata(EntityMeta::InHeader(meta, None, HeaderType::Yaml)).unwrap();
         live.set_content("Hello").unwrap();
 
-        let content = crate::entity::utils::try_load_file_as_string(&*live.root.fs.borrow(), &PathBuf::from("foo/entity1.md")).unwrap().unwrap();
+        let content = crate::entity::utils::try_load_file_as_string(&*live.root.fs.lock().unwrap(), &PathBuf::from("foo/entity1.md")).unwrap().unwrap();
         assert!(content.contains("---\nkey: val\n---\n"));
     }
 
@@ -637,7 +643,7 @@ mod tests {
         let mut fs = mockfs::MockFS::new();
         create_file_with_content(&mut fs, "foo/entity1", "content.md", "```toml\nkey = \"val\"\n```\n---\nHello");
         create_file_with_content(&mut fs, "foo/entity1", "child1.md", "Child content");
-        let fs = Rc::new(RefCell::new(fs));
+        let fs = Arc::new(Mutex::new(fs));
         let schema = setup_schema();
 
         let live = LiveEntity::new(
@@ -666,7 +672,7 @@ mod tests {
     #[test]
     fn test_live_entity_write() {
         let fs = mockfs::MockFS::new();
-        let fs = Rc::new(RefCell::new(fs));
+        let fs = Arc::new(Mutex::new(fs));
         let schema = setup_schema();
 
         let live = LiveEntity::new(
@@ -697,7 +703,7 @@ mod tests {
         let mut fs = mockfs::MockFS::new();
         create_file_with_content(&mut fs, "foo/entity1", "content.md", "Inside");
         create_file_with_content(&mut fs, "foo", "entity1.md", "Parallel");
-        let fs = Rc::new(RefCell::new(fs));
+        let fs = Arc::new(Mutex::new(fs));
         let schema = setup_schema();
 
         let live = LiveEntity::new(
@@ -715,7 +721,7 @@ mod tests {
     fn test_metadata_cleanup() {
         let mut fs = mockfs::MockFS::new();
         create_file_with_content(&mut fs, "foo", "entity1.meta.toml", "a = 1");
-        let fs = Rc::new(RefCell::new(fs));
+        let fs = Arc::new(Mutex::new(fs));
         let schema = setup_schema();
 
         let live = LiveEntity::new(
@@ -733,7 +739,7 @@ mod tests {
     fn test_live_entity_delete() {
         let mut fs = mockfs::MockFS::new();
         create_file_with_content(&mut fs, "foo/entity1", "content.md", "Hello");
-        let fs = Rc::new(RefCell::new(fs));
+        let fs = Arc::new(Mutex::new(fs));
         let schema = setup_schema();
 
         let live = LiveEntity::new(
@@ -751,7 +757,7 @@ mod tests {
     fn test_live_entity_move() {
         let mut fs = mockfs::MockFS::new();
         create_file_with_content(&mut fs, "foo", "entity1.md", "Content");
-        let fs = Rc::new(RefCell::new(fs));
+        let fs = Arc::new(Mutex::new(fs));
         let schema = setup_schema();
 
         let mut live = LiveEntity::new(
@@ -770,7 +776,7 @@ mod tests {
     fn test_live_entity_auto_type_resolution() {
         let mut fs = mockfs::MockFS::new();
         create_file_with_content(&mut fs, "project", "meta.toml", "type = \"Project\"");
-        let fs = Rc::new(RefCell::new(fs));
+        let fs = Arc::new(Mutex::new(fs));
 
         let mut schema = Schema::new();
         schema.add_entity_type(EntityTypeDescription {
@@ -778,7 +784,7 @@ mod tests {
             children: vec![],
             allow_additional: true,
         });
-        let schema = Rc::new(schema);
+        let schema = Arc::new(schema);
 
         let live = LiveEntity::new(
             fs,
@@ -796,7 +802,7 @@ mod tests {
         let mut fs = mockfs::MockFS::new();
         create_file_with_content(&mut fs, "project", "schema.toml", "");
         create_file_with_content(&mut fs, "project", "meta.toml", "type = \"Project\"");
-        let fs = Rc::new(RefCell::new(fs));
+        let fs = Arc::new(Mutex::new(fs));
 
         let mut schema = Schema::new();
         schema.add_entity_type(EntityTypeDescription {
@@ -809,7 +815,7 @@ mod tests {
             }],
             allow_additional: true,
         });
-        let schema = Rc::new(schema);
+        let schema = Arc::new(schema);
 
         let live = LiveEntity::new(
             fs,
