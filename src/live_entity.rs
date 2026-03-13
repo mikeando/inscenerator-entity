@@ -5,7 +5,9 @@ use std::fmt;
 use anyhow::{bail};
 use inscenerator_xfs::Xfs;
 
-use crate::entity::{EntityPath, EntityPathEntry, EntityContent, EntityMeta, utils};
+use std::io::Write;
+
+use crate::entity::{EntityPath, EntityPathEntry, EntityContent, EntityMeta, Metadata, utils};
 use crate::schema::{Schema};
 
 /// Shared context for a tree of LiveEntities.
@@ -35,6 +37,414 @@ pub struct LiveEntity {
     pub path: EntityPath,
     /// Type name of the entity.
     pub node_type: String,
+}
+
+/// Controls where content is written relative to the entity's disk path.
+#[derive(Debug, Clone)]
+enum ChildContentLayout {
+    /// Layout is chosen automatically: Slash entries use Inside, Dot entries use Parallel.
+    Inferred,
+    /// Content is written inside the entity's directory (`dir/content.md`).
+    Inside,
+    /// Content is written alongside the entity (`name.md`).
+    Parallel,
+}
+
+/// Builder for creating a new child entity on disk.
+///
+/// Obtain via [`LiveEntity::create_child`]. Call [`build`](ChildBuilder::build) to write to disk.
+#[derive(Debug, Clone)]
+pub struct ChildBuilder {
+    root: Arc<LiveEntityRoot>,
+    /// Logical path of the parent entity.
+    parent_path: EntityPath,
+    /// Node type of the parent (may be "Auto", resolved via actual_type() at build time).
+    parent_node_type: String,
+    entry: EntityPathEntry,
+    node_type_override: Option<String>,
+    content_text: Option<String>,
+    content_layout: ChildContentLayout,
+    metadata: Option<EntityMeta>,
+    nested_children: Vec<ChildBuilder>,
+}
+
+impl ChildBuilder {
+    /// Overrides the node type inferred from the schema.
+    ///
+    /// Required when the schema slot is `"Auto"` or the parent has `allow_additional = true`.
+    /// If the schema infers a concrete type, the override must match it exactly.
+    /// Last call wins.
+    pub fn with_type(mut self, node_type: &str) -> Self {
+        self.node_type_override = Some(node_type.to_string());
+        self
+    }
+
+    /// Sets the content text, inferring layout from entry type.
+    ///
+    /// Slash entries default to Inside (`dir/content.md`);
+    /// Dot entries default to Parallel (`name.md`).
+    /// Last call wins.
+    pub fn with_content(mut self, text: &str) -> Self {
+        self.content_text = Some(text.to_string());
+        self.content_layout = ChildContentLayout::Inferred;
+        self
+    }
+
+    /// Sets the content text and forces Inside layout (`dir/content.md`).
+    ///
+    /// Last call wins.
+    pub fn with_content_inside(mut self, text: &str) -> Self {
+        self.content_text = Some(text.to_string());
+        self.content_layout = ChildContentLayout::Inside;
+        self
+    }
+
+    /// Sets the content text and forces Parallel layout (`name.md`).
+    ///
+    /// Last call wins.
+    pub fn with_content_parallel(mut self, text: &str) -> Self {
+        self.content_text = Some(text.to_string());
+        self.content_layout = ChildContentLayout::Parallel;
+        self
+    }
+
+    /// Sets metadata from an [`EntityMeta`] value.
+    ///
+    /// The layout (Inside, Parallel, InHeader) is taken from the variant.
+    /// `EntityMeta::None` clears any previously set metadata.
+    /// Last call wins.
+    pub fn with_metadata(mut self, meta: EntityMeta) -> Self {
+        if matches!(meta, EntityMeta::None) {
+            self.metadata = None;
+        } else {
+            self.metadata = Some(meta);
+        }
+        self
+    }
+
+    /// Sets metadata to be written inside the entity directory (`dir/meta.toml`).
+    ///
+    /// Last call wins.
+    pub fn with_metadata_inside(mut self, meta: Metadata) -> Self {
+        self.metadata = Some(EntityMeta::Inside(meta));
+        self
+    }
+
+    /// Sets metadata to be written alongside the entity (`name.meta.toml`).
+    ///
+    /// Last call wins.
+    pub fn with_metadata_parallel(mut self, meta: Metadata) -> Self {
+        self.metadata = Some(EntityMeta::Parallel(meta));
+        self
+    }
+
+    /// Adds a nested child builder.
+    ///
+    /// The closure receives a fresh [`ChildBuilder`] whose parent path is set to this
+    /// entity's path. Configure it inside the closure and return the result.
+    /// Nested children are built (in order) when [`build`](Self::build) is called.
+    pub fn with_child<F>(mut self, entry: EntityPathEntry, f: F) -> Self
+    where
+        F: FnOnce(ChildBuilder) -> ChildBuilder,
+    {
+        let own_path = self.parent_path.extend(self.entry.clone());
+        let inner = ChildBuilder {
+            root: self.root.clone(),
+            parent_path: own_path,
+            parent_node_type: String::new(), // intentionally unused: nested builders
+                                             // always enter via build_internal(parent_type),
+                                             // never via build() which reads this field
+            entry,
+            node_type_override: None,
+            content_text: None,
+            content_layout: ChildContentLayout::Inferred,
+            metadata: None,
+            nested_children: vec![],
+        };
+        self.nested_children.push(f(inner));
+        self
+    }
+
+    /// Validates configuration, writes the child entity to disk, and returns a handle to it.
+    ///
+    /// For Slash entries this always creates a directory. For Dot entries at least
+    /// one of content, metadata, or nested children must be provided.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the child already exists, if the schema rejects the child name
+    /// or type, if InHeader metadata is set without content, or if disk access fails.
+    pub fn build(self) -> anyhow::Result<LiveEntity> {
+        let parent_live = LiveEntity {
+            root: self.root.clone(),
+            path: self.parent_path.clone(),
+            node_type: self.parent_node_type.clone(),
+        };
+        let parent_type = parent_live.actual_type()?;
+        self.build_internal(&parent_type)
+    }
+
+    fn build_internal(mut self, parent_type: &str) -> anyhow::Result<LiveEntity> {
+        // --- Type resolution ---
+        let child_name = match &self.entry {
+            EntityPathEntry::Slash(n) | EntityPathEntry::Dot(n) => n.as_str(),
+        };
+
+        let entity_type_descriptor = self.root.schema.get_entity_type(parent_type)?;
+
+        let inferred_type: Option<String> = entity_type_descriptor
+            .children
+            .iter()
+            .find(|rule| {
+                regex::Regex::new(&rule.name_regex)
+                    .map(|re| re.is_match(child_name))
+                    .unwrap_or(false)
+            })
+            .map(|rule| rule.node_type.clone());
+
+        let resolved_type = match (&inferred_type, &self.node_type_override) {
+            // Rule matched, no override
+            (Some(inferred), None) => inferred.clone(),
+            // Rule matched, override matches
+            (Some(inferred), Some(override_type)) if inferred == override_type => inferred.clone(),
+            // Rule matched "Auto", override provides concrete type
+            (Some(inferred), Some(override_type)) if inferred == "Auto" => override_type.clone(),
+            // Rule matched concrete type, override differs => error
+            (Some(inferred), Some(override_type)) => {
+                bail!(
+                    "Type mismatch: schema inferred '{}' but with_type specified '{}'",
+                    inferred, override_type
+                );
+            }
+            // No rule matched, allow_additional = true, override provided
+            (None, Some(override_type)) if entity_type_descriptor.allow_additional => {
+                override_type.clone()
+            }
+            // No rule matched, allow_additional = true, no override => error
+            (None, None) if entity_type_descriptor.allow_additional => {
+                bail!(
+                    "Child '{}' does not match any schema rule; call with_type() to specify its type",
+                    child_name
+                );
+            }
+            // No rule matched, allow_additional = false => error
+            (None, _) => {
+                bail!("Unexpected child '{}' in entity of type '{}'", child_name, parent_type);
+            }
+        };
+
+        // If the schema rule explicitly sets node_type = "Auto" but no with_type() was called,
+        // we cannot write a meaningful type — error eagerly rather than deferring to the next read.
+        if resolved_type == "Auto" && self.node_type_override.is_none() {
+            let child_name = match &self.entry {
+                EntityPathEntry::Slash(n) | EntityPathEntry::Dot(n) => n.as_str(),
+            };
+            bail!(
+                "Child '{}' has schema type 'Auto' — call with_type() to specify the concrete type",
+                child_name
+            );
+        }
+
+        // Determine whether this is an Auto-override case
+        let is_auto_override = inferred_type.as_deref() == Some("Auto")
+            || (inferred_type.is_none() && entity_type_descriptor.allow_additional);
+
+        // For Auto-override with metadata provided, validate it's a Table
+        if is_auto_override {
+            if let Some(ref meta) = self.metadata {
+                let meta_value = match meta {
+                    EntityMeta::Inside(m) | EntityMeta::Parallel(m) => Some(&m.value),
+                    EntityMeta::InHeader(m, _, _) => Some(&m.value),
+                    EntityMeta::None => None,
+                };
+                if let Some(v) = meta_value {
+                    if !v.is_table() {
+                        bail!("Metadata value must be a TOML table to merge 'type' key");
+                    }
+                }
+            }
+        }
+
+        // Merge type key into existing metadata for Auto-override
+        if is_auto_override && self.metadata.is_some() {
+            match &mut self.metadata {
+                Some(EntityMeta::Inside(m)) | Some(EntityMeta::Parallel(m)) => {
+                    if let toml::Value::Table(ref mut table) = m.value {
+                        table.insert(
+                            "type".to_string(),
+                            toml::Value::String(resolved_type.clone()),
+                        );
+                    }
+                    // (Table check already done above — if not a Table, we already bailed)
+                }
+                Some(EntityMeta::InHeader(m, _, _)) => {
+                    if let toml::Value::Table(ref mut table) = m.value {
+                        table.insert(
+                            "type".to_string(),
+                            toml::Value::String(resolved_type.clone()),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Root entity may only have Slash children
+        if self.parent_path.entries.is_empty() {
+            if let EntityPathEntry::Dot(_) = &self.entry {
+                bail!("Root entities may only have Slash children");
+            }
+        }
+
+        let own_path = self.parent_path.extend(self.entry.clone());
+        let own_disk_path = own_path.to_pathbuf(&self.root.base_path);
+
+        match &self.entry {
+            EntityPathEntry::Slash(_) => {
+                // Existence check
+                {
+                    let fs = self.root.fs.lock().unwrap();
+                    if fs.is_dir(&own_disk_path) {
+                        bail!("Child already exists at {:?}", own_disk_path);
+                    }
+                }
+                // Create directory
+                self.root.fs.lock().unwrap().create_dir_all(&own_disk_path)?;
+            }
+            EntityPathEntry::Dot(n) => {
+                // Dot child must have content, metadata, or nested children
+                if self.content_text.is_none()
+                    && self.metadata.is_none()
+                    && self.nested_children.is_empty()
+                {
+                    bail!("Dot child '{}' has nothing to write to disk; provide content, metadata, or children", n);
+                }
+
+                // Existence check: .md or .meta.toml files
+                {
+                    let fs_guard = self.root.fs.lock().unwrap();
+                    if fs_guard.is_file(&own_disk_path.with_added_extension("md"))
+                        || fs_guard.is_file(&own_disk_path.with_added_extension("meta.toml"))
+                    {
+                        bail!("Dot child '{}' already exists at {:?}", n, own_disk_path);
+                    }
+                    // Also check for any file in the parent dir that starts with "parent.notes."
+                    let check_dir = own_disk_path.parent().unwrap();
+                    let own_name = own_disk_path.file_name().unwrap().to_str().unwrap();
+                    let dot_prefix = format!("{}.", own_name);
+                    if let Ok(entries) = fs_guard.read_dir(check_dir) {
+                        for entry in entries.flatten() {
+                            if let Some(fname_str) = entry.path().file_name().and_then(|f| f.to_str()) {
+                                if fname_str.starts_with(&dot_prefix) {
+                                    bail!("Dot child '{}' already exists (found {:?})", n, entry.path());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // InHeader metadata requires content
+        if let Some(EntityMeta::InHeader(_, _, _)) = &self.metadata {
+            if self.content_text.is_none() {
+                bail!("InHeader metadata requires content to be set via with_content()");
+            }
+        }
+
+        // Write type to metadata for Auto-override (minimal meta.toml when no user metadata provided)
+        let auto_type_written = is_auto_override && self.metadata.is_none();
+        if auto_type_written {
+            let meta_path = match &self.entry {
+                EntityPathEntry::Slash(_) => own_disk_path.join("meta.toml"),
+                EntityPathEntry::Dot(_) => own_disk_path.with_added_extension("meta.toml"),
+            };
+            let content = format!("type = \"{}\"\n", resolved_type);
+            let mut fs = self.root.fs.lock().unwrap();
+            if let Some(parent) = meta_path.parent() {
+                fs.create_dir_all(parent)?;
+            }
+            fs.writer(&meta_path)?.write_all(content.as_bytes())?;
+        }
+
+        let return_node_type = if is_auto_override {
+            "Auto".to_string()
+        } else {
+            resolved_type.clone()
+        };
+
+        // Compute the content path (needed for both plain content write and InHeader)
+        let content_path = match self.content_layout {
+            ChildContentLayout::Inside => own_disk_path.join("content.md"),
+            ChildContentLayout::Parallel => own_disk_path.with_added_extension("md"),
+            ChildContentLayout::Inferred => match &self.entry {
+                EntityPathEntry::Slash(_) => own_disk_path.join("content.md"),
+                EntityPathEntry::Dot(_) => own_disk_path.with_added_extension("md"),
+            },
+        };
+
+        // --- Content write ---
+        // Skip plain content write when InHeader is used (written together with header below)
+        let is_inheader = matches!(&self.metadata, Some(EntityMeta::InHeader(_, _, _)));
+        if let Some(ref text) = self.content_text {
+            if !is_inheader {
+                let mut fs = self.root.fs.lock().unwrap();
+                if let Some(parent) = content_path.parent() {
+                    fs.create_dir_all(parent)?;
+                }
+                fs.writer(&content_path)?.write_all(text.as_bytes())?;
+            }
+        }
+
+        // --- Metadata write ---
+        if !auto_type_written {
+            if let Some(ref meta) = self.metadata {
+                match meta {
+                    EntityMeta::Inside(m) => {
+                        let path = own_disk_path.join("meta.toml");
+                        let toml_str = toml::to_string(&m.value)?;
+                        let mut fs = self.root.fs.lock().unwrap();
+                        if let Some(p) = path.parent() {
+                            fs.create_dir_all(p)?;
+                        }
+                        fs.writer(&path)?.write_all(toml_str.as_bytes())?;
+                    }
+                    EntityMeta::Parallel(m) => {
+                        let path = own_disk_path.with_added_extension("meta.toml");
+                        let toml_str = toml::to_string(&m.value)?;
+                        let mut fs = self.root.fs.lock().unwrap();
+                        if let Some(p) = path.parent() {
+                            fs.create_dir_all(p)?;
+                        }
+                        fs.writer(&path)?.write_all(toml_str.as_bytes())?;
+                    }
+                    EntityMeta::InHeader(m, sep, header_type) => {
+                        // Content is guaranteed to be present (checked above)
+                        let text = self.content_text.as_deref().unwrap_or("");
+                        let header = utils::format_metadata_header(m, *header_type, sep.as_deref(), text)?;
+                        let full_content = header + text;
+                        let mut fs = self.root.fs.lock().unwrap();
+                        if let Some(p) = content_path.parent() {
+                            fs.create_dir_all(p)?;
+                        }
+                        fs.writer(&content_path)?.write_all(full_content.as_bytes())?;
+                    }
+                    EntityMeta::None => {} // filtered in with_metadata
+                }
+            }
+        }
+
+        // Build nested children
+        for nested in self.nested_children {
+            nested.build_internal(&resolved_type)?;
+        }
+
+        Ok(LiveEntity {
+            root: self.root,
+            path: own_path,
+            node_type: return_node_type,
+        })
+    }
 }
 
 impl LiveEntity {
@@ -119,26 +529,35 @@ impl LiveEntity {
         Ok(t)
     }
 
+    /// Returns the full disk path for this entity's directory (or sibling base for Dot entries).
     fn on_disk_path(&self) -> PathBuf {
         self.path.to_pathbuf(&self.root.base_path)
     }
 
+    /// Parallel content path: `name.md` (lives alongside the entity, not inside it).
     fn dot_content_path(&self) -> PathBuf {
         self.on_disk_path().with_added_extension("md")
     }
 
+    /// Inside content path: `dir/content.md`.
     fn slash_content_path(&self) -> PathBuf {
         self.on_disk_path().join("content.md")
     }
 
+    /// Parallel metadata path: `name.meta.toml`.
     fn dot_metadata_path(&self) -> PathBuf {
         self.on_disk_path().with_extension("meta.toml")
     }
 
+    /// Inside metadata path: `dir/meta.toml`.
     fn slash_metadata_path(&self) -> PathBuf {
         self.on_disk_path().join("meta.toml")
     }
 
+    /// Reads raw content from disk, auto-detecting Parallel vs Inside layout.
+    ///
+    /// Returns `(raw_text, is_parallel, path_used)`. Returns an error if both
+    /// Parallel and Inside content files exist simultaneously.
     fn get_content_info(&self) -> anyhow::Result<(Option<String>, bool, PathBuf)> {
         let fs = self.root.fs.lock().unwrap();
         let is_root = self.path.entries.is_empty();
@@ -547,32 +966,23 @@ impl LiveEntity {
         Ok(())
     }
 
-    /// Creates a new child entity handle.
+    /// Creates a builder for a new child entity.
     ///
-    /// Note: This does not write anything to disk immediately unless it is a Slash entry,
-    /// in which case the parent directory is created.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if disk access fails.
-    pub fn create_child(
-        &self,
-        entry: EntityPathEntry,
-        node_type: String,
-    ) -> anyhow::Result<LiveEntity> {
-        let child_path = self.path.extend(entry.clone());
-        let child_handle = LiveEntity {
+    /// The child's node type is inferred from the parent schema; call
+    /// [`ChildBuilder::with_type`] if the schema cannot determine it.
+    /// All validation and disk writes happen in [`ChildBuilder::build`].
+    pub fn create_child(&self, entry: EntityPathEntry) -> ChildBuilder {
+        ChildBuilder {
             root: self.root.clone(),
-            path: child_path,
-            node_type,
-        };
-
-        if let EntityPathEntry::Slash(_) = entry {
-            let mut fs = self.root.fs.lock().unwrap();
-            fs.create_dir_all(&self.on_disk_path())?;
+            parent_path: self.path.clone(),
+            parent_node_type: self.node_type.clone(),
+            entry,
+            node_type_override: None,
+            content_text: None,
+            content_layout: ChildContentLayout::Inferred,
+            metadata: None,
+            nested_children: vec![],
         }
-
-        Ok(child_handle)
     }
 }
 
@@ -581,6 +991,7 @@ mod tests {
     use super::*;
     use crate::entity::HeaderType;
     use inscenerator_xfs::mockfs;
+    use inscenerator_xfs::XfsReadOnly;
     use crate::schema::ChildEntityRules;
     use crate::schema::EntityTypeDescription;
     use std::path::Path;
@@ -693,8 +1104,9 @@ mod tests {
         assert_eq!(live.metadata().unwrap(), EntityMeta::Inside(meta));
 
         // 3. create_child
-        let child = live.create_child(EntityPathEntry::Dot("child1".to_string()), "Type".to_string()).unwrap();
-        child.set_content("Child content").unwrap();
+        live.create_child(EntityPathEntry::Slash("child1".to_string()))
+            .build()
+            .unwrap();
         assert_eq!(live.children().unwrap().len(), 1);
     }
 
@@ -798,6 +1210,308 @@ mod tests {
     }
 
     #[test]
+    fn test_create_child_slash_creates_directory() {
+        let fs = mockfs::MockFS::new();
+        let fs = Arc::new(Mutex::new(fs));
+        let schema = setup_schema();
+
+        let live = LiveEntity::new(
+            fs.clone(),
+            PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("parent"),
+            "Type".to_string(),
+            schema,
+        );
+
+        live.create_child(EntityPathEntry::Slash("child".to_string()))
+            .build()
+            .unwrap();
+
+        assert!(fs.lock().unwrap().is_dir(&PathBuf::from("foo/parent/child")));
+    }
+
+    #[test]
+    fn test_create_child_slash_errors_if_directory_exists() {
+        let mut fs = mockfs::MockFS::new();
+        fs.create_dir_all(&PathBuf::from("foo/parent/child")).unwrap();
+        let fs = Arc::new(Mutex::new(fs));
+        let schema = setup_schema();
+
+        let live = LiveEntity::new(
+            fs.clone(),
+            PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("parent"),
+            "Type".to_string(),
+            schema,
+        );
+
+        let err = live
+            .create_child(EntityPathEntry::Slash("child".to_string()))
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_create_child_dot_on_root_errors() {
+        let fs = mockfs::MockFS::new();
+        let fs = Arc::new(Mutex::new(fs));
+        let schema = setup_schema();
+
+        let root = LiveEntity::new(
+            fs.clone(),
+            PathBuf::from("project"),
+            EntityPath::empty(),
+            "Type".to_string(),
+            schema,
+        );
+
+        let err = root
+            .create_child(EntityPathEntry::Dot("notes".to_string()))
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("Root entities may only have Slash children"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_type_inferred_from_schema_rule() {
+        let mut schema = Schema::new();
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Parent".to_string(),
+            children: vec![ChildEntityRules {
+                name_regex: "^child_".to_string(),
+                node_type: "Child".to_string(),
+                required: false,
+                multiple: true,
+            }],
+            allow_additional: false,
+        });
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Child".to_string(),
+            children: vec![],
+            allow_additional: false,
+        });
+        let schema = Arc::new(schema);
+
+        let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
+        let live = LiveEntity::new(
+            fs.clone(),
+            PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("root"),
+            "Parent".to_string(),
+            schema,
+        );
+
+        let child = live
+            .create_child(EntityPathEntry::Slash("child_one".to_string()))
+            .build()
+            .unwrap();
+
+        assert_eq!(child.node_type, "Child");
+    }
+
+    #[test]
+    fn test_type_resolution_errors_on_unexpected_child() {
+        let mut schema = Schema::new();
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Parent".to_string(),
+            children: vec![ChildEntityRules {
+                name_regex: "^child_".to_string(),
+                node_type: "Child".to_string(),
+                required: false,
+                multiple: true,
+            }],
+            allow_additional: false,
+        });
+        let schema = Arc::new(schema);
+
+        let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
+        let live = LiveEntity::new(
+            fs, PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("root"),
+            "Parent".to_string(), schema,
+        );
+
+        let err = live
+            .create_child(EntityPathEntry::Slash("other".to_string()))
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("Unexpected child"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_with_type_matching_concrete_rule_is_accepted() {
+        // with_type("Child") matches what the schema says — no error
+        let mut schema = Schema::new();
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Parent".to_string(),
+            children: vec![ChildEntityRules {
+                name_regex: "^child_".to_string(),
+                node_type: "Child".to_string(),
+                required: false,
+                multiple: true,
+            }],
+            allow_additional: false,
+        });
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Child".to_string(),
+            children: vec![],
+            allow_additional: false,
+        });
+        let schema = Arc::new(schema);
+
+        let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
+        let live = LiveEntity::new(
+            fs, PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("root"),
+            "Parent".to_string(), schema,
+        );
+
+        let child = live
+            .create_child(EntityPathEntry::Slash("child_one".to_string()))
+            .with_type("Child") // matches schema — should succeed
+            .build()
+            .unwrap();
+
+        assert_eq!(child.node_type, "Child");
+    }
+
+    #[test]
+    fn test_type_resolution_errors_when_allow_additional_needs_with_type() {
+        // allow_additional = true but no rule match and no with_type() => error
+        let mut schema = Schema::new();
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Parent".to_string(),
+            children: vec![],
+            allow_additional: true,
+        });
+        let schema = Arc::new(schema);
+
+        let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
+        let live = LiveEntity::new(
+            fs, PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("root"),
+            "Parent".to_string(), schema,
+        );
+
+        let err = live
+            .create_child(EntityPathEntry::Slash("anything".to_string()))
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("with_type"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_with_type_override_for_auto_slot() {
+        // allow_additional=true + with_type("Chapter") → write meta.toml, return node_type="Auto"
+        let mut schema = Schema::new();
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Parent".to_string(),
+            children: vec![],
+            allow_additional: true,
+        });
+        let schema = Arc::new(schema);
+
+        let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
+        let live = LiveEntity::new(
+            fs.clone(),
+            PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("root"),
+            "Parent".to_string(),
+            schema,
+        );
+
+        let child = live
+            .create_child(EntityPathEntry::Slash("item".to_string()))
+            .with_type("Chapter")
+            .build()
+            .unwrap();
+
+        // Returned handle has node_type = "Auto" (reads from metadata at load time)
+        assert_eq!(child.node_type, "Auto");
+
+        // meta.toml written with type = "Chapter"
+        let meta_content = {
+            let fs_guard = fs.lock().unwrap();
+            crate::entity::utils::try_load_file_as_string(
+                &*fs_guard,
+                &PathBuf::from("foo/root/item/meta.toml"),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert!(meta_content.contains("type = \"Chapter\""), "got: {}", meta_content);
+
+        // actual_type() resolves to "Chapter"
+        assert_eq!(child.actual_type().unwrap(), "Chapter");
+    }
+
+    #[test]
+    fn test_with_type_conflict_errors() {
+        // Schema says "Scene", but with_type("Chapter") conflicts
+        let mut schema = Schema::new();
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Parent".to_string(),
+            children: vec![ChildEntityRules {
+                name_regex: ".*".to_string(),
+                node_type: "Scene".to_string(),
+                required: false,
+                multiple: true,
+            }],
+            allow_additional: false,
+        });
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Scene".to_string(),
+            children: vec![],
+            allow_additional: false,
+        });
+        let schema = Arc::new(schema);
+
+        let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
+        let live = LiveEntity::new(
+            fs, PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("root"),
+            "Parent".to_string(), schema,
+        );
+
+        let err = live
+            .create_child(EntityPathEntry::Slash("thing".to_string()))
+            .with_type("Chapter")  // conflicts: schema says "Scene"
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("mismatch"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_with_type_errors_if_metadata_value_is_not_a_table() {
+        // Auto slot + with_type("X") + metadata whose toml::Value is not a Table => error
+        let mut schema = Schema::new();
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Parent".to_string(),
+            children: vec![],
+            allow_additional: true,
+        });
+        let schema = Arc::new(schema);
+
+        let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
+        let live = LiveEntity::new(
+            fs, PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("root"),
+            "Parent".to_string(), schema,
+        );
+
+        // Deliberately construct a non-Table Metadata value
+        let bad_meta = Metadata { value: toml::Value::String("not a table".to_string()) };
+        let err = live
+            .create_child(EntityPathEntry::Slash("item".to_string()))
+            .with_type("Chapter")
+            .with_metadata_inside(bad_meta)
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("table"), "got: {}", err);
+    }
+
+    #[test]
     fn test_live_entity_ignore_schema_toml() {
         let mut fs = mockfs::MockFS::new();
         create_file_with_content(&mut fs, "project", "schema.toml", "");
@@ -828,5 +1542,359 @@ mod tests {
         let children = live.children().unwrap();
         // Should not include schema.toml even with permissive regex and allow_additional
         assert_eq!(children.len(), 0);
+    }
+
+    #[test]
+    fn test_with_content_slash_writes_inside() {
+        let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
+        let schema = setup_schema();
+        let live = LiveEntity::new(
+            fs.clone(), PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("parent"),
+            "Type".to_string(), schema,
+        );
+
+        live.create_child(EntityPathEntry::Slash("child".to_string()))
+            .with_content("Hello Inside")
+            .build()
+            .unwrap();
+
+        let content = crate::entity::utils::try_load_file_as_string(
+            &*fs.lock().unwrap(),
+            &PathBuf::from("foo/parent/child/content.md"),
+        ).unwrap().unwrap();
+        assert_eq!(content, "Hello Inside");
+    }
+
+    #[test]
+    fn test_with_content_dot_writes_parallel() {
+        let mut raw_fs = mockfs::MockFS::new();
+        // parent dir must exist so the Dot existence check's read_dir can scan it
+        raw_fs.create_dir_all(&PathBuf::from("foo/parent")).unwrap();
+        let fs = Arc::new(Mutex::new(raw_fs));
+        let schema = setup_schema();
+        let live = LiveEntity::new(
+            fs.clone(), PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("parent"),
+            "Type".to_string(), schema,
+        );
+
+        live.create_child(EntityPathEntry::Dot("notes".to_string()))
+            .with_content("Hello Parallel")
+            .build()
+            .unwrap();
+
+        let content = crate::entity::utils::try_load_file_as_string(
+            &*fs.lock().unwrap(),
+            &PathBuf::from("foo/parent.notes.md"),
+        ).unwrap().unwrap();
+        assert_eq!(content, "Hello Parallel");
+    }
+
+    #[test]
+    fn test_with_content_inside_forces_inside_layout() {
+        // Dot child but forced Inside layout — writes to own_disk_path/content.md
+        let mut raw_fs = mockfs::MockFS::new();
+        raw_fs.create_dir_all(&PathBuf::from("foo/parent")).unwrap();
+        let fs = Arc::new(Mutex::new(raw_fs));
+        let schema = setup_schema();
+        let live = LiveEntity::new(
+            fs.clone(), PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("parent"),
+            "Type".to_string(), schema,
+        );
+
+        live.create_child(EntityPathEntry::Dot("notes".to_string()))
+            .with_content_inside("Forced Inside")
+            .build()
+            .unwrap();
+
+        // own_disk_path for Dot("notes") under foo/parent = foo/parent.notes
+        // Inside: foo/parent.notes/content.md
+        let content = crate::entity::utils::try_load_file_as_string(
+            &*fs.lock().unwrap(),
+            &PathBuf::from("foo/parent.notes/content.md"),
+        ).unwrap().unwrap();
+        assert_eq!(content, "Forced Inside");
+    }
+
+    #[test]
+    fn test_with_content_parallel_forces_parallel_layout() {
+        // Slash child but forced Parallel layout — writes to own_disk_path.with_added_extension("md")
+        let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
+        let schema = setup_schema();
+        let live = LiveEntity::new(
+            fs.clone(), PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("parent"),
+            "Type".to_string(), schema,
+        );
+
+        live.create_child(EntityPathEntry::Slash("child".to_string()))
+            .with_content_parallel("Forced Parallel")
+            .build()
+            .unwrap();
+
+        // Parallel path for Slash entry: own_disk_path = foo/parent/child → foo/parent/child.md
+        let content = crate::entity::utils::try_load_file_as_string(
+            &*fs.lock().unwrap(),
+            &PathBuf::from("foo/parent/child.md"),
+        ).unwrap().unwrap();
+        assert_eq!(content, "Forced Parallel");
+    }
+
+    #[test]
+    fn test_with_metadata_inside_slash_child() {
+        let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
+        let schema = setup_schema();
+        let live = LiveEntity::new(
+            fs.clone(), PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("parent"),
+            "Type".to_string(), schema,
+        );
+
+        let meta = Metadata { value: toml::from_str("title = \"Test\"").unwrap() };
+        live.create_child(EntityPathEntry::Slash("child".to_string()))
+            .with_metadata_inside(meta)
+            .build()
+            .unwrap();
+
+        let raw = crate::entity::utils::try_load_file_as_string(
+            &*fs.lock().unwrap(),
+            &PathBuf::from("foo/parent/child/meta.toml"),
+        ).unwrap().unwrap();
+        assert!(raw.contains("title"), "got: {}", raw);
+    }
+
+    #[test]
+    fn test_with_metadata_parallel_dot_child() {
+        let mut raw_fs = mockfs::MockFS::new();
+        raw_fs.create_dir_all(&PathBuf::from("foo/parent")).unwrap();
+        let fs = Arc::new(Mutex::new(raw_fs));
+        let schema = setup_schema();
+        let live = LiveEntity::new(
+            fs.clone(), PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("parent"),
+            "Type".to_string(), schema,
+        );
+
+        let meta = Metadata { value: toml::from_str("note = \"yes\"").unwrap() };
+        live.create_child(EntityPathEntry::Dot("notes".to_string()))
+            .with_metadata_parallel(meta)
+            .build()
+            .unwrap();
+
+        let raw = crate::entity::utils::try_load_file_as_string(
+            &*fs.lock().unwrap(),
+            &PathBuf::from("foo/parent.notes.meta.toml"),
+        ).unwrap().unwrap();
+        assert!(raw.contains("note"), "got: {}", raw);
+    }
+
+    #[test]
+    fn test_dot_child_with_no_content_metadata_or_children_errors() {
+        let mut raw_fs = mockfs::MockFS::new();
+        raw_fs.create_dir_all(&PathBuf::from("foo/parent")).unwrap();
+        let fs = Arc::new(Mutex::new(raw_fs));
+        let schema = setup_schema();
+        let live = LiveEntity::new(
+            fs.clone(), PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("parent"),
+            "Type".to_string(), schema,
+        );
+
+        let err = live
+            .create_child(EntityPathEntry::Dot("notes".to_string()))
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("nothing to write"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_dot_child_errors_if_files_exist() {
+        let mut raw_fs = mockfs::MockFS::new();
+        raw_fs.create_dir_all(&PathBuf::from("foo/parent")).unwrap();
+        raw_fs.add_r(
+            &PathBuf::from("foo/parent.notes.md"),
+            b"existing".to_vec(),
+        ).unwrap();
+        let fs = Arc::new(Mutex::new(raw_fs));
+        let schema = setup_schema();
+        let live = LiveEntity::new(
+            fs.clone(), PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("parent"),
+            "Type".to_string(), schema,
+        );
+
+        let err = live
+            .create_child(EntityPathEntry::Dot("notes".to_string()))
+            .with_content("text")
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_with_type_merges_type_into_existing_metadata() {
+        // allow_additional slot + with_type("Chapter") + with_metadata_inside(m)
+        // => meta.toml contains both "title" and "type" keys
+        let mut schema = Schema::new();
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Parent".to_string(),
+            children: vec![],
+            allow_additional: true,
+        });
+        let schema = Arc::new(schema);
+
+        let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
+        let live = LiveEntity::new(
+            fs.clone(), PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("root"),
+            "Parent".to_string(), schema,
+        );
+
+        let meta = Metadata {
+            value: toml::from_str("title = \"My Chapter\"").unwrap(),
+        };
+        live.create_child(EntityPathEntry::Slash("item".to_string()))
+            .with_type("Chapter")
+            .with_metadata_inside(meta)
+            .build()
+            .unwrap();
+
+        let raw = crate::entity::utils::try_load_file_as_string(
+            &*fs.lock().unwrap(),
+            &PathBuf::from("foo/root/item/meta.toml"),
+        ).unwrap().unwrap();
+        assert!(raw.contains("type"), "missing type key: {}", raw);
+        assert!(raw.contains("title"), "missing title key: {}", raw);
+    }
+
+    #[test]
+    fn test_inheader_metadata_without_content_errors() {
+        let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
+        let schema = setup_schema();
+        let live = LiveEntity::new(
+            fs.clone(), PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("parent"),
+            "Type".to_string(), schema,
+        );
+
+        let meta = Metadata { value: toml::from_str("key = \"val\"").unwrap() };
+        let err = live
+            .create_child(EntityPathEntry::Slash("child".to_string()))
+            .with_metadata(EntityMeta::InHeader(meta, None, crate::entity::HeaderType::Yaml))
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("InHeader"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_with_child_creates_nested_structure() {
+        let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
+        let schema = setup_schema();
+        let live = LiveEntity::new(
+            fs.clone(), PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("root"),
+            "Type".to_string(), schema,
+        );
+
+        live.create_child(EntityPathEntry::Slash("chapter".to_string()))
+            .with_child(EntityPathEntry::Slash("scene".to_string()), |b| {
+                b.with_content("Scene content")
+            })
+            .build()
+            .unwrap();
+
+        // chapter/ directory created
+        assert!(fs.lock().unwrap().is_dir(&PathBuf::from("foo/root/chapter")));
+        // scene/ directory and content.md created
+        assert!(fs.lock().unwrap().is_dir(&PathBuf::from("foo/root/chapter/scene")));
+        let content = crate::entity::utils::try_load_file_as_string(
+            &*fs.lock().unwrap(),
+            &PathBuf::from("foo/root/chapter/scene/content.md"),
+        ).unwrap().unwrap();
+        assert_eq!(content, "Scene content");
+    }
+
+    #[test]
+    fn test_with_child_type_resolution_uses_outer_resolved_type() {
+        // Outer: "Parent" has rule "^ch_" → "Chapter"
+        // "Chapter" has rule "^sc_" → "Scene"
+        // Verify nested child is resolved as "Scene" based on outer child's type "Chapter"
+        let mut schema = Schema::new();
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Parent".to_string(),
+            children: vec![ChildEntityRules {
+                name_regex: "^ch_".to_string(),
+                node_type: "Chapter".to_string(),
+                required: false,
+                multiple: true,
+            }],
+            allow_additional: false,
+        });
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Chapter".to_string(),
+            children: vec![ChildEntityRules {
+                name_regex: "^sc_".to_string(),
+                node_type: "Scene".to_string(),
+                required: false,
+                multiple: true,
+            }],
+            allow_additional: false,
+        });
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Scene".to_string(),
+            children: vec![],
+            allow_additional: false,
+        });
+        let schema = Arc::new(schema);
+
+        let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
+        let live = LiveEntity::new(
+            fs.clone(), PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("root"),
+            "Parent".to_string(), schema,
+        );
+
+        let chapter = live
+            .create_child(EntityPathEntry::Slash("ch_one".to_string()))
+            .with_child(EntityPathEntry::Slash("sc_one".to_string()), |b| b)
+            .build()
+            .unwrap();
+
+        assert_eq!(chapter.node_type, "Chapter");
+
+        let scenes = chapter.children().unwrap();
+        assert_eq!(scenes.len(), 1);
+        assert_eq!(scenes[0].node_type, "Scene");
+    }
+
+    #[test]
+    fn test_auto_schema_type_without_with_type_errors() {
+        let mut schema = Schema::new();
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Parent".to_string(),
+            children: vec![ChildEntityRules {
+                name_regex: ".*".to_string(),
+                node_type: "Auto".to_string(),
+                required: false,
+                multiple: true,
+            }],
+            allow_additional: false,
+        });
+        let schema = Arc::new(schema);
+
+        let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
+        let live = LiveEntity::new(
+            fs, PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("root"),
+            "Parent".to_string(), schema,
+        );
+
+        let err = live
+            .create_child(EntityPathEntry::Slash("thing".to_string()))
+            .build() // no with_type() call
+            .unwrap_err();
+        assert!(err.to_string().contains("Auto"), "got: {}", err);
     }
 }

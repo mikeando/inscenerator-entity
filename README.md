@@ -157,6 +157,44 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
+### Creating Children (ChildBuilder)
+
+`LiveEntity::create_child` returns a fluent `ChildBuilder`. Call `.build()` to validate and write to disk. The node type is inferred from the parent schema — use `.with_type()` only when the schema slot is `"Auto"` or `allow_additional = true`.
+
+```rust
+use inscenerator_entity::entity::{EntityMeta, EntityPathEntry, Metadata};
+
+// Slash child — type inferred from schema; creates a directory on disk
+let chapter = project
+    .create_child(EntityPathEntry::Slash("010_chapter-one".to_string()))
+    .with_content("# Chapter One\n\nOnce upon a time...")
+    .with_metadata_inside(Metadata { value: toml::from_str("title = \"Chapter One\"")? })
+    .build()?;
+
+// Dot child — lives alongside the parent (e.g. 010_chapter-one.notes.md)
+chapter
+    .create_child(EntityPathEntry::Dot("notes".to_string()))
+    .with_content("Research notes.")
+    .build()?;
+
+// Nested children via with_child
+project
+    .create_child(EntityPathEntry::Slash("020_chapter-two".to_string()))
+    .with_child(EntityPathEntry::Slash("010_first-scene".to_string()), |b| {
+        b.with_content("The scene begins...")
+    })
+    .build()?;
+
+// Auto slot — schema allows additional children; concrete type written to meta.toml
+let item = project
+    .create_child(EntityPathEntry::Slash("epilogue".to_string()))
+    .with_type("Epilogue")
+    .build()?;
+// item.actual_type()? == "Epilogue"
+```
+
+See `examples/create_child.rs` for a complete runnable example.
+
 ## Development
 
 ### GitHub Codespaces / VS Code Dev Containers
