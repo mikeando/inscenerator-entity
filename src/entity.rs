@@ -804,6 +804,15 @@ pub struct Entity {
     pub children: Vec<Entity>,
 }
 
+/// Parse front matter (TOML or YAML) from a Markdown content string.
+///
+/// Returns `(metadata, separator, body_content, header_type)` or `None` if no
+/// valid front matter block is found at the start of the content.
+pub fn parse_front_matter(
+    content: &str,
+) -> Option<(Metadata, Option<String>, String, HeaderType)> {
+    utils::parse_header(content)
+}
 
 #[cfg(test)]
 mod common {
