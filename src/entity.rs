@@ -1821,6 +1821,110 @@ mod entity_tests {
         let e = entity.unwrap();
         assert_eq!(e.node_type, "Project".to_string());
     }
+
+    #[test]
+    fn test_ignore_slash_child() {
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "project", "meta.toml", "type = \"Project\"");
+        create_file_with_content(&mut fs, "project/010_chapter", "content.md", "chapter");
+        create_file_with_content(&mut fs, "project/booker-data", "state.json", "{}");
+
+        let mut loader = EntityLoader::new();
+        loader.schema.add_entity_type(EntityTypeDescription {
+            name: "Project".to_string(),
+            children: vec![ChildEntityRules {
+                name_regex: "^[0-9]+_".to_string(),
+                node_type: "Chapter".to_string(),
+                required: false,
+                multiple: true,
+            }],
+            allow_additional: false,
+            ignore: vec!["booker-data".to_string()],
+        });
+        loader.schema.add_entity_type(EntityTypeDescription {
+            name: "Chapter".to_string(),
+            children: vec![],
+            allow_additional: false,
+            ignore: vec![],
+        });
+
+        let entity = loader
+            .try_load_entity(&fs, &PathBuf::from("project"), &EntityPath::empty(), "Project")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entity.children.len(), 1);
+        assert_eq!(entity.children[0].node_type, "Chapter");
+    }
+
+    #[test]
+    fn test_ignore_dot_child() {
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "project/parent", "content.md", "parent");
+        create_file_with_content(&mut fs, "project", "parent.child.md", "child content");
+        create_file_with_content(&mut fs, "project", "parent.booker-data.md", "tool data");
+
+        let mut loader = EntityLoader::new();
+        loader.schema.add_entity_type(EntityTypeDescription {
+            name: "Parent".to_string(),
+            children: vec![ChildEntityRules {
+                name_regex: "^child$".to_string(),
+                node_type: "Child".to_string(),
+                required: false,
+                multiple: false,
+            }],
+            allow_additional: false,
+            ignore: vec!["booker-data".to_string()],
+        });
+        loader.schema.add_entity_type(EntityTypeDescription {
+            name: "Child".to_string(),
+            children: vec![],
+            allow_additional: false,
+            ignore: vec![],
+        });
+
+        let entity_path = EntityPath::empty().extend_slash("parent");
+        let entity = loader
+            .try_load_entity(&fs, &PathBuf::from("project"), &entity_path, "Parent")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entity.children.len(), 1);
+        assert_eq!(entity.children[0].node_type, "Child");
+    }
+
+    #[test]
+    fn test_ignore_multiple_entries() {
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "project", "meta.toml", "type = \"Project\"");
+        create_file_with_content(&mut fs, "project/010_chapter", "content.md", "chapter");
+        create_file_with_content(&mut fs, "project/booker-data", "state.json", "{}");
+        create_file_with_content(&mut fs, "project/cache", "data.bin", "");
+
+        let mut loader = EntityLoader::new();
+        loader.schema.add_entity_type(EntityTypeDescription {
+            name: "Project".to_string(),
+            children: vec![ChildEntityRules {
+                name_regex: "^[0-9]+_".to_string(),
+                node_type: "Chapter".to_string(),
+                required: false,
+                multiple: true,
+            }],
+            allow_additional: false,
+            ignore: vec!["booker-data".to_string(), "cache".to_string()],
+        });
+        loader.schema.add_entity_type(EntityTypeDescription {
+            name: "Chapter".to_string(),
+            children: vec![],
+            allow_additional: false,
+            ignore: vec![],
+        });
+
+        let entity = loader
+            .try_load_entity(&fs, &PathBuf::from("project"), &EntityPath::empty(), "Project")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entity.children.len(), 1);
+        assert_eq!(entity.children[0].node_type, "Chapter");
+    }
 }
 
 // #[test]

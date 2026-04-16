@@ -1959,4 +1959,97 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("Auto"), "got: {}", err);
     }
+
+    #[test]
+    fn test_children_ignores_slash_child_in_ignore_list() {
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "project", "meta.toml", "type = \"Project\"");
+        create_file_with_content(&mut fs, "project/010_chapter", "content.md", "chapter");
+        create_file_with_content(&mut fs, "project/booker-data", "state.json", "{}");
+        let fs = Arc::new(Mutex::new(fs));
+
+        let mut schema = Schema::new();
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Project".to_string(),
+            children: vec![ChildEntityRules {
+                name_regex: "^[0-9]+_".to_string(),
+                node_type: "Chapter".to_string(),
+                required: false,
+                multiple: true,
+            }],
+            allow_additional: false,
+            ignore: vec!["booker-data".to_string()],
+        });
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Chapter".to_string(),
+            children: vec![],
+            allow_additional: false,
+            ignore: vec![],
+        });
+        let schema = Arc::new(schema);
+
+        let live = LiveEntity::new(fs, PathBuf::from("project"), EntityPath::empty(), "Project".to_string(), schema);
+        let children = live.children().unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].node_type, "Chapter");
+    }
+
+    #[test]
+    fn test_children_ignores_dot_child_in_ignore_list() {
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "project/parent", "content.md", "parent");
+        create_file_with_content(&mut fs, "project", "parent.real-child.md", "child");
+        create_file_with_content(&mut fs, "project", "parent.booker-data.md", "tool data");
+        let fs = Arc::new(Mutex::new(fs));
+
+        let mut schema = Schema::new();
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Parent".to_string(),
+            children: vec![ChildEntityRules {
+                name_regex: "^real-child$".to_string(),
+                node_type: "Child".to_string(),
+                required: false,
+                multiple: false,
+            }],
+            allow_additional: false,
+            ignore: vec!["booker-data".to_string()],
+        });
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Child".to_string(),
+            children: vec![],
+            allow_additional: false,
+            ignore: vec![],
+        });
+        let schema = Arc::new(schema);
+
+        let live = LiveEntity::new(
+            fs, PathBuf::from("project"),
+            EntityPath::empty().extend_slash("parent"),
+            "Parent".to_string(), schema,
+        );
+        let children = live.children().unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].node_type, "Child");
+    }
+
+    #[test]
+    fn test_children_ignore_prevents_unexpected_child_error() {
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "project", "meta.toml", "type = \"Project\"");
+        create_file_with_content(&mut fs, "project/booker-data", "state.json", "{}");
+        let fs = Arc::new(Mutex::new(fs));
+
+        let mut schema = Schema::new();
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Project".to_string(),
+            children: vec![],
+            allow_additional: false,
+            ignore: vec!["booker-data".to_string()],
+        });
+        let schema = Arc::new(schema);
+
+        let live = LiveEntity::new(fs, PathBuf::from("project"), EntityPath::empty(), "Project".to_string(), schema);
+        let children = live.children().unwrap();
+        assert_eq!(children.len(), 0);
+    }
 }
