@@ -984,6 +984,47 @@ impl LiveEntity {
             nested_children: vec![],
         }
     }
+    
+    pub fn child(&self, name: &str) -> anyhow::Result<LiveEntity> {
+        
+        let slash_path = self.path.extend_slash(name);
+        let slash_child_exists = self.root.fs.lock().unwrap().is_dir(&slash_path.to_pathbuf(&self.root.base_path));
+        
+        
+        let dot_path = self.path.extend_dot(name);
+        // TODO: It is possible that a dot child exists with neither content or metadata file.
+        let dot_content_path = dot_path.to_pathbuf(&self.root.base_path).with_added_extension("md");
+        let dot_metadata_path = dot_path.to_pathbuf(&self.root.base_path).with_added_extension("meta.toml");
+        let dot_child_exists = self.root.fs.lock().unwrap().is_file(&dot_content_path)
+            || self.root.fs.lock().unwrap().is_file(&dot_metadata_path);
+
+        let actual_type = self.actual_type()?;
+        let entity_type_descriptor = self.root.schema.get_entity_type(&actual_type)?;
+
+        match (slash_child_exists, dot_child_exists) {
+            (true, true) => bail!("Both Slash and Dot child exist with name '{}'", name),
+            (true, false) => {
+                let child_path = slash_path;
+                let node_type = entity_type_descriptor.child_type(name)?;
+                Ok(LiveEntity {
+                    root: self.root.clone(),
+                    path: child_path.clone(),
+                    node_type,
+                    })
+            },
+            (false, true) => {
+                let child_path = dot_path;
+                let node_type = entity_type_descriptor.child_type(name)?;
+
+                Ok(LiveEntity {
+                    root: self.root.clone(),
+                    path: child_path.clone(),
+                    node_type
+                })
+            }
+            (false, false) => bail!("No child found with name '{}'", name),
+        }   
+    }
 }
 
 #[cfg(test)]

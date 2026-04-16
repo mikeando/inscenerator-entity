@@ -30,6 +30,19 @@ pub struct EntityTypeDescription {
     pub allow_additional: bool,
 }
 
+impl EntityTypeDescription {
+    pub(crate) fn child_type(&self, name: &str) -> anyhow::Result<String> {
+        for child_rule in &self.children {
+            let re = regex::Regex::new(&child_rule.name_regex)
+                .map_err(|e| anyhow!("Invalid regex in schema for {}: {}", child_rule.name_regex, e))?;
+            if re.is_match(name) {
+                return Ok(child_rule.node_type.clone());
+            }
+        }
+        Err(anyhow!("No matching child rule found for {}", name))
+    }
+}
+
 /// A collection of entity type descriptions.
 #[derive(Default, Clone, Debug)]
 pub struct Schema {
