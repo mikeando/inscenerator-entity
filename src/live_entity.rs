@@ -687,6 +687,9 @@ impl LiveEntity {
         let mut loaded_children = vec![];
         for child_path in children_paths {
             let child_name: &str = child_path.last_name().unwrap();
+            if entity_type_descriptor.ignore.iter().any(|s| s == child_name) {
+                continue;
+            }
             let mut found_match = false;
             for child_rule in &entity_type_descriptor.children {
                 let re = regex::Regex::new(&child_rule.name_regex).unwrap();
@@ -1061,6 +1064,7 @@ mod tests {
                 multiple: true,
             }],
             allow_additional: true,
+            ignore: vec![],
         });
         Arc::new(schema)
     }
@@ -1236,6 +1240,7 @@ mod tests {
             name: "Project".to_string(),
             children: vec![],
             allow_additional: true,
+            ignore: vec![],
         });
         let schema = Arc::new(schema);
 
@@ -1326,11 +1331,13 @@ mod tests {
                 multiple: true,
             }],
             allow_additional: false,
+            ignore: vec![],
         });
         schema.add_entity_type(EntityTypeDescription {
             name: "Child".to_string(),
             children: vec![],
             allow_additional: false,
+            ignore: vec![],
         });
         let schema = Arc::new(schema);
 
@@ -1363,6 +1370,7 @@ mod tests {
                 multiple: true,
             }],
             allow_additional: false,
+            ignore: vec![],
         });
         let schema = Arc::new(schema);
 
@@ -1393,11 +1401,13 @@ mod tests {
                 multiple: true,
             }],
             allow_additional: false,
+            ignore: vec![],
         });
         schema.add_entity_type(EntityTypeDescription {
             name: "Child".to_string(),
             children: vec![],
             allow_additional: false,
+            ignore: vec![],
         });
         let schema = Arc::new(schema);
 
@@ -1425,6 +1435,7 @@ mod tests {
             name: "Parent".to_string(),
             children: vec![],
             allow_additional: true,
+            ignore: vec![],
         });
         let schema = Arc::new(schema);
 
@@ -1450,6 +1461,7 @@ mod tests {
             name: "Parent".to_string(),
             children: vec![],
             allow_additional: true,
+            ignore: vec![],
         });
         let schema = Arc::new(schema);
 
@@ -1500,11 +1512,13 @@ mod tests {
                 multiple: true,
             }],
             allow_additional: false,
+            ignore: vec![],
         });
         schema.add_entity_type(EntityTypeDescription {
             name: "Scene".to_string(),
             children: vec![],
             allow_additional: false,
+            ignore: vec![],
         });
         let schema = Arc::new(schema);
 
@@ -1531,6 +1545,7 @@ mod tests {
             name: "Parent".to_string(),
             children: vec![],
             allow_additional: true,
+            ignore: vec![],
         });
         let schema = Arc::new(schema);
 
@@ -1569,6 +1584,7 @@ mod tests {
                 multiple: true,
             }],
             allow_additional: true,
+            ignore: vec![],
         });
         let schema = Arc::new(schema);
 
@@ -1783,6 +1799,7 @@ mod tests {
             name: "Parent".to_string(),
             children: vec![],
             allow_additional: true,
+            ignore: vec![],
         });
         let schema = Arc::new(schema);
 
@@ -1872,6 +1889,7 @@ mod tests {
                 multiple: true,
             }],
             allow_additional: false,
+            ignore: vec![],
         });
         schema.add_entity_type(EntityTypeDescription {
             name: "Chapter".to_string(),
@@ -1882,11 +1900,13 @@ mod tests {
                 multiple: true,
             }],
             allow_additional: false,
+            ignore: vec![],
         });
         schema.add_entity_type(EntityTypeDescription {
             name: "Scene".to_string(),
             children: vec![],
             allow_additional: false,
+            ignore: vec![],
         });
         let schema = Arc::new(schema);
 
@@ -1922,6 +1942,7 @@ mod tests {
                 multiple: true,
             }],
             allow_additional: false,
+            ignore: vec![],
         });
         let schema = Arc::new(schema);
 

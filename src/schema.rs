@@ -28,6 +28,9 @@ pub struct EntityTypeDescription {
     pub children: Vec<ChildEntityRules>,
     /// Whether to allow additional children not covered by the rules.
     pub allow_additional: bool,
+    /// Exact child names to ignore entirely (e.g. non-entity tool directories).
+    #[serde(default)]
+    pub ignore: Vec<String>,
 }
 
 impl EntityTypeDescription {
@@ -54,6 +57,8 @@ pub struct Schema {
 struct RawEntityTypeDescription {
     pub children: Vec<ChildEntityRules>,
     pub allow_additional: bool,
+    #[serde(default)]
+    pub ignore: Vec<String>,
 }
 
 impl Schema {
@@ -96,6 +101,7 @@ impl Schema {
                         name,
                         children: raw.children,
                         allow_additional: raw.allow_additional,
+                        ignore: raw.ignore,
                     },
                 )
             })
@@ -220,5 +226,35 @@ children = []
         // Should have 1 child (some_child), but NOT schema.toml
         assert_eq!(root.children.len(), 1);
         assert_eq!(root.children[0].path.entries.last().unwrap().to_pathbuf(Path::new("")).to_str().unwrap(), "some_child");
+    }
+
+    #[test]
+    fn test_load_schema_and_root_ignores_listed_directories() {
+        let mut fs = mockfs::MockFS::new();
+        let schema_toml = r#"
+[Project]
+allow_additional = false
+ignore = ["booker-data"]
+[[Project.children]]
+name_regex = "^[0-9]+_"
+node_type = "Chapter"
+required = false
+multiple = true
+
+[Chapter]
+allow_additional = true
+children = []
+"#;
+        create_file_with_content(&mut fs, "project", "schema.toml", schema_toml);
+        create_file_with_content(&mut fs, "project", "meta.toml", "type = \"Project\"");
+        create_file_with_content(&mut fs, "project/010_chap", "content.md", "Chapter content");
+        create_file_with_content(&mut fs, "project/booker-data", "some_file.txt", "tool data");
+
+        let schema = Schema::load_from_file(&fs, &Path::new("project/schema.toml")).unwrap();
+        assert_eq!(schema.entity_types["Project"].ignore, vec!["booker-data"]);
+
+        let (_, root) = load_schema_and_root(&fs, &Path::new("project")).unwrap();
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].node_type, "Chapter");
     }
 }

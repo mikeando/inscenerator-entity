@@ -22,6 +22,7 @@ fn main() -> anyhow::Result<()> {
             multiple: true,
         }],
         allow_additional: false,
+        ignore: vec![],
     });
     schema.add_entity_type(EntityTypeDescription {
         name: "Chapter".to_string(),
@@ -32,11 +33,13 @@ fn main() -> anyhow::Result<()> {
             multiple: true,
         }],
         allow_additional: true,
+        ignore: vec![],
     });
     schema.add_entity_type(EntityTypeDescription {
         name: "Scene".to_string(),
         children: vec![],
         allow_additional: false,
+        ignore: vec![],
     });
     let schema = Arc::new(schema);
 

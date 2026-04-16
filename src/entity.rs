@@ -597,6 +597,9 @@ impl EntityLoader {
         let mut loaded_children: Vec<Entity> = vec![];
         for child_entity_path in children {
             let child_name = child_entity_path.last_name().unwrap();
+            if entity_type_descriptor.ignore.iter().any(|s| s == child_name) {
+                continue;
+            }
             let mut found_match = false;
             for child_rule in &entity_type_descriptor.children {
                 let re = regex::Regex::new(&child_rule.name_regex).unwrap();
@@ -831,6 +834,7 @@ mod common {
                     multiple: true,
                 }],
                 allow_additional: false,
+                ignore: vec![],
             },
         );
         loader.schema.add_entity_type(
@@ -838,6 +842,7 @@ mod common {
                 name: "ChildTestType".to_string(),
                 children: vec![],
                 allow_additional: false,
+                ignore: vec![],
             },
         );
         loader
@@ -1225,6 +1230,7 @@ mod entity_tests {
                     },
                 ],
                 allow_additional: false,
+                ignore: vec![],
             },
         );
         loader.schema.add_entity_type(
@@ -1237,6 +1243,7 @@ mod entity_tests {
                     multiple: true,
                 }],
                 allow_additional: false,
+                ignore: vec![],
             },
         );
         loader.schema.add_entity_type(
@@ -1244,6 +1251,7 @@ mod entity_tests {
                 name: "Scene".to_string(),
                 children: vec![],
                 allow_additional: true,
+                ignore: vec![],
             },
         );
         loader.schema.add_entity_type(
@@ -1256,6 +1264,7 @@ mod entity_tests {
                     multiple: true,
                 }],
                 allow_additional: true,
+                ignore: vec![],
             },
         );
 
@@ -1766,6 +1775,7 @@ mod entity_tests {
                     multiple: true,
                 }],
                 allow_additional: false,
+                ignore: vec![],
             },
         );
         loader.schema.entity_types.insert(
@@ -1774,6 +1784,7 @@ mod entity_tests {
                 name: "ChildTestType".to_string(),
                 children: vec![],
                 allow_additional: false,
+                ignore: vec![],
             },
         );
 
@@ -1799,6 +1810,7 @@ mod entity_tests {
                 name: "Project".to_string(),
                 children: vec![],
                 allow_additional: true,
+                ignore: vec![],
             },
         );
 
