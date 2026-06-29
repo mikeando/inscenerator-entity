@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.7
+- Exposed `parse_front_matter` as a public API.
+- Added `LiveEntity::child()` for direct child access by name (checks both slash-path and dot-path forms).
+- Added ignore list to `EntityTypeDescription` — schema can now list directory/file names to skip during child discovery (e.g. `ignore = ["booker-data"]`).
+
+## v0.1.6
+- Improved `LiveEntity` child creation options.
+- Replaced `Rc<RefCell<dyn Xfs>>` with `Arc<Mutex<dyn Xfs + Send + Sync>>` for thread-safe filesystem access.
+
 ## v0.1.5
 - Added `Entity::metadata_mut()`
 - Allow YAML front-matter as metadata source. 
