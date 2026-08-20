@@ -817,6 +817,17 @@ pub fn parse_front_matter(
     utils::parse_header(content)
 }
 
+/// Serialize front matter (TOML or YAML) back into a Markdown content string,
+/// the inverse of `parse_front_matter`.
+pub fn format_metadata_header(
+    metadata: &Metadata,
+    header_type: HeaderType,
+    sep: Option<&str>,
+    content_body: &str,
+) -> anyhow::Result<String> {
+    utils::format_metadata_header(metadata, header_type, sep, content_body)
+}
+
 #[cfg(test)]
 mod common {
     use super::*;
