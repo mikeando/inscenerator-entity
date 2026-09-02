@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context};
 use inscenerator_xfs::Xfs;
 
+use crate::placement::MetaLocation;
+
 // (Almost) Everything is an entity.
 //
 // An entity has optional content, optional children, a location, and some metadata.
@@ -623,7 +625,10 @@ impl EntityLoader {
 
         let (content, metadata_from_content) = if let Some(c) = content_str {
             let (m, a) = utils::parse_header(&c)
-                .map(|(m, s, a, h)| (Some(EntityMeta::InHeader(m, s, h)), a))
+                .map(|(m, separator, a, header_type)| {
+                    let origin = MetaOrigin::Header { header_type, separator };
+                    (Some(MetaSource { origin, state: MetaState::Parsed(m) }), a)
+                })
                 .unwrap_or((None, c));
             if is_parallel {
                 (EntityContent::Parallel(a), m)
@@ -648,22 +653,23 @@ impl EntityLoader {
 
         let mut meta_sources = Vec::new();
         if let Some(m) = dot_metadata {
-            meta_sources.push(EntityMeta::Parallel(m));
+            meta_sources.push(MetaSource {
+                origin: MetaOrigin::ParallelSidecar,
+                state: MetaState::Parsed(m),
+            });
         }
         if let Some(m) = slash_metadata {
-            meta_sources.push(EntityMeta::Inside(m));
+            meta_sources.push(MetaSource {
+                origin: MetaOrigin::InsideSidecar,
+                state: MetaState::Parsed(m),
+            });
         }
         if let Some(m) = metadata_from_content {
             meta_sources.push(m);
         }
-
-        if meta_sources.len() > 1 {
-            bail!(
-                "Multiple metadata sources found for entity at {:?}.",
-                entity_path.to_pathbuf(base_path)
-            );
-        }
-        let metadata = meta_sources.into_iter().next().unwrap_or(EntityMeta::None);
+        // Several sources merge per key (D2); the ambiguity is reported as a finding in
+        // Task 6 rather than refused here.
+        let metadata = EntityMeta::of(meta_sources);
 
         // Now get the children!
         let dot_children = if !is_root {
@@ -685,7 +691,7 @@ impl EntityLoader {
 
         // Determine the actual type
         let actual_type = if entity_type == "Auto" {
-            let m = metadata.metadata().ok_or_else(|| {
+            let m = metadata.merged()?.ok_or_else(|| {
                 anyhow!(
                     "Entity at '{:?}' has Auto type but no metadata",
                     entity_path.to_pathbuf(base_path)
@@ -705,7 +711,7 @@ impl EntityLoader {
             }
             t
         } else {
-            if let Some(m) = metadata.metadata() {
+            if let Some(m) = metadata.merged()? {
                 if let Some(t) = m.get_str("type")? {
                     if t != entity_type {
                         bail!("Entity at '{:?}' has type '{}' in metadata, but was expected to be '{}'", entity_path.to_pathbuf(base_path), t, entity_type);
@@ -782,7 +788,7 @@ impl EntityWriter {
             entity.content.is_none() && entity.metadata.is_none() && entity.children.is_empty();
         let needs_directory = is_empty
             || entity.content.is_inside()
-            || entity.metadata.is_inside()
+            || entity.metadata.source_at(MetaLocation::InsideSidecar).is_some()
             || entity
                 .children
                 .iter()
@@ -791,10 +797,25 @@ impl EntityWriter {
             fs.create_dir_all(&entity_path)?;
         }
 
+        let header_source = entity.metadata.source_at(MetaLocation::InHeader);
+
         if let Some(content) = entity.content.content() {
             let mut to_write = String::new();
-            if let EntityMeta::InHeader(m, sep, header_type) = &entity.metadata {
-                to_write.push_str(&utils::format_metadata_header(m, *header_type, sep.as_deref(), content)?);
+            if let Some(source) = header_source {
+                let MetaOrigin::Header { header_type, separator } = &source.origin else {
+                    unreachable!("source_at(InHeader) returns a header origin")
+                };
+                match &source.state {
+                    MetaState::Parsed(m) => to_write.push_str(&utils::format_metadata_header(
+                        m,
+                        *header_type,
+                        separator.as_deref(),
+                        content,
+                    )?),
+                    // A block we could not parse goes back exactly as it came, so a
+                    // load/save cycle cannot destroy it (D3).
+                    MetaState::Malformed { raw, .. } => to_write.push_str(raw),
+                }
             }
             to_write.push_str(content);
 
@@ -804,26 +825,27 @@ impl EntityWriter {
                 _ => unreachable!(),
             };
             fs.writer(&path)?.write_all(to_write.as_bytes())?;
-        } else if let EntityMeta::InHeader(_, _, _) = &entity.metadata {
+        } else if header_source.is_some() {
             bail!(
                 "Metadata from header requires content for entity at {:?}",
                 entity.path.to_pathbuf(base_path)
             );
         }
 
-        match &entity.metadata {
-            EntityMeta::Parallel(metadata) => {
-                let toml_str = toml::to_string(&metadata.value)?;
-                let dot_metadata_file = entity_path.with_extension("meta.toml");
-                fs.writer(&dot_metadata_file)?
-                    .write_all(toml_str.as_bytes())?;
-            }
-            EntityMeta::Inside(metadata) => {
-                let toml_str = toml::to_string(&metadata.value)?;
-                fs.writer(&entity_path.join("meta.toml"))?
-                    .write_all(toml_str.as_bytes())?;
-            }
-            EntityMeta::None | EntityMeta::InHeader(_, _, _) => {}
+        // Every sidecar source is written, so a node carrying more than one round-trips.
+        for source in entity.metadata.sources() {
+            let path = match source.location() {
+                MetaLocation::InHeader => continue,
+                // TODO(Task 7): route through placement, which appends rather than
+                // substitutes. `with_extension` here is C1.
+                MetaLocation::ParallelSidecar => entity_path.with_extension("meta.toml"),
+                MetaLocation::InsideSidecar => entity_path.join("meta.toml"),
+            };
+            let text = match &source.state {
+                MetaState::Parsed(m) => toml::to_string(&m.value)?,
+                MetaState::Malformed { raw, .. } => raw.clone(),
+            };
+            fs.writer(&path)?.write_all(text.as_bytes())?;
         }
 
         for child in &entity.children {
@@ -875,50 +897,257 @@ pub enum HeaderType {
     Yaml,
 }
 
+/// The parse state of one metadata source.
+///
+/// A source that failed to parse is kept rather than dropped, with its raw text and the
+/// error, so a caller can inspect and repair it and so a save cannot destroy a file the
+/// library could not read (D3).
 #[derive(Debug, PartialEq, Clone)]
-pub enum EntityMeta {
-    None,
-    /// metadata is found at entity.meta.toml
-    Parallel(Metadata),
-    /// metadata is found at entity/meta.toml
-    Inside(Metadata),
-    /// metadata is found in the content file
-    InHeader(Metadata, Option<String>, HeaderType),
+pub enum MetaState {
+    Parsed(Metadata),
+    Malformed { raw: String, error: String },
+}
+
+/// Where one metadata source sits — and, for front matter, how it was written, so a save
+/// reproduces the block rather than normalising it.
+///
+/// This is the *observed* counterpart to [`MetaLocation`], which stays payload-free
+/// because intent and per-key routing are expressed in it.
+#[derive(Debug, PartialEq, Clone)]
+pub enum MetaOrigin {
+    /// Front matter in the content file, wherever layout put that file.
+    Header {
+        header_type: HeaderType,
+        separator: Option<String>,
+    },
+    /// `S.meta.toml`
+    ParallelSidecar,
+    /// `S/meta.toml`
+    InsideSidecar,
+}
+
+impl MetaOrigin {
+    /// The layout-facing location of this origin.
+    pub fn location(&self) -> MetaLocation {
+        match self {
+            MetaOrigin::Header { .. } => MetaLocation::InHeader,
+            MetaOrigin::ParallelSidecar => MetaLocation::ParallelSidecar,
+            MetaOrigin::InsideSidecar => MetaLocation::InsideSidecar,
+        }
+    }
+}
+
+/// One metadata source, as observed on disk.
+#[derive(Debug, PartialEq, Clone)]
+pub struct MetaSource {
+    pub origin: MetaOrigin,
+    pub state: MetaState,
+}
+
+impl MetaSource {
+    pub fn location(&self) -> MetaLocation {
+        self.origin.location()
+    }
+
+    /// The parsed table, or `None` if this source is malformed.
+    pub fn metadata(&self) -> Option<&Metadata> {
+        match &self.state {
+            MetaState::Parsed(m) => Some(m),
+            MetaState::Malformed { .. } => None,
+        }
+    }
+
+    /// The text as found on disk, for a malformed source only.
+    pub fn raw(&self) -> Option<&str> {
+        match &self.state {
+            MetaState::Malformed { raw, .. } => Some(raw),
+            MetaState::Parsed(_) => None,
+        }
+    }
+
+    /// The parse error, for a malformed source only.
+    pub fn error(&self) -> Option<&str> {
+        match &self.state {
+            MetaState::Malformed { error, .. } => Some(error),
+            MetaState::Parsed(_) => None,
+        }
+    }
+
+    pub fn is_malformed(&self) -> bool {
+        matches!(self.state, MetaState::Malformed { .. })
+    }
+}
+
+/// One key held by two or more sources with differing values — §4.5's unroutable case.
+#[derive(Debug, PartialEq, Clone)]
+pub struct MetaConflict {
+    pub key: String,
+    pub locations: Vec<MetaLocation>,
+}
+
+/// An entity's metadata, as the set of sources observed on disk.
+///
+/// Zero sources means no metadata; one is the ordinary case; several merge per key
+/// (§4.5), which is observable but never *intendable* — a schema declares one layout and
+/// so one sidecar location.
+///
+/// Sources are held in [`MetaLocation`] order, and every method here is a function of
+/// that ordered list. Two `EntityMeta` that compare equal therefore also behave alike —
+/// merge the same way, and route writes to the same files.
+#[derive(Debug, PartialEq, Clone, Default)]
+pub struct EntityMeta {
+    sources: Vec<MetaSource>,
 }
 
 impl EntityMeta {
-    pub fn is_none(&self) -> bool {
-        matches!(self, EntityMeta::None)
+    /// Builds from observed sources, ordering them by location so that merge precedence
+    /// does not depend on the order the loader happened to probe in.
+    pub fn of(mut sources: Vec<MetaSource>) -> EntityMeta {
+        sources.sort_by_key(|s| s.location());
+        EntityMeta { sources }
     }
 
-    pub fn metadata(&self) -> Option<&Metadata> {
-        match self {
-            EntityMeta::None => None,
-            EntityMeta::Parallel(m) => Some(m),
-            EntityMeta::Inside(m) => Some(m),
-            EntityMeta::InHeader(m, _, _) => Some(m),
-        }
-    }
-
-    pub fn metadata_mut(&mut self) -> Option<&mut Metadata> {
-        match self {
-            EntityMeta::None => None,
-            EntityMeta::Parallel(m) => Some(m),
-            EntityMeta::Inside(m) => Some(m),
-            EntityMeta::InHeader(m, _, _) => Some(m),
-        }
+    /// A single parsed source at `origin`.
+    pub fn at(origin: MetaOrigin, m: Metadata) -> EntityMeta {
+        EntityMeta::of(vec![MetaSource { origin, state: MetaState::Parsed(m) }])
     }
 
     pub fn parallel(m: Metadata) -> EntityMeta {
-        EntityMeta::Parallel(m)
+        EntityMeta::at(MetaOrigin::ParallelSidecar, m)
     }
 
     pub fn inside(m: Metadata) -> EntityMeta {
-        EntityMeta::Inside(m)
+        EntityMeta::at(MetaOrigin::InsideSidecar, m)
     }
 
-    fn is_inside(&self) -> bool {
-        matches!(self, EntityMeta::Inside(_))
+    pub fn in_header(m: Metadata, separator: Option<String>, header_type: HeaderType) -> EntityMeta {
+        EntityMeta::at(MetaOrigin::Header { header_type, separator }, m)
+    }
+
+    pub fn sources(&self) -> &[MetaSource] {
+        &self.sources
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.sources.is_empty()
+    }
+
+    /// The single source, when there is exactly one — the ordinary case.
+    pub fn single(&self) -> Option<&MetaSource> {
+        match self.sources.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    /// The single source's parsed table, mutably — `None` unless there is exactly one
+    /// source and it parsed.
+    pub fn single_parsed_mut(&mut self) -> Option<&mut Metadata> {
+        match self.sources.as_mut_slice() {
+            [only] => match &mut only.state {
+                MetaState::Parsed(m) => Some(m),
+                MetaState::Malformed { .. } => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The source at `location`, if present.
+    pub fn source_at(&self, location: MetaLocation) -> Option<&MetaSource> {
+        self.sources.iter().find(|s| s.location() == location)
+    }
+
+    pub fn locations(&self) -> Vec<MetaLocation> {
+        self.sources.iter().map(|s| s.location()).collect()
+    }
+
+    pub fn malformed(&self) -> Vec<&MetaSource> {
+        self.sources.iter().filter(|s| s.is_malformed()).collect()
+    }
+
+    /// Which source holds `key`. When several do, the one that wins the merge.
+    pub fn location_of(&self, key: &str) -> Option<MetaLocation> {
+        self.sources
+            .iter()
+            .rev()
+            .find(|s| s.metadata().and_then(|m| m.value.get(key)).is_some())
+            .map(|s| s.location())
+    }
+
+    /// Where a write of `key` should land. §4.5.
+    ///
+    /// A key that already exists never moves — the source holding it wins. A key new to
+    /// this node goes to its single source when it has exactly one (§4.3 step 2), and
+    /// otherwise to `intended`, the location this node's layout would have chosen.
+    ///
+    /// Depends only on which locations are present, never on the order they were
+    /// observed in.
+    pub fn write_location(&self, key: &str, intended: MetaLocation) -> MetaLocation {
+        if let Some(location) = self.location_of(key) {
+            return location;
+        }
+        match self.single() {
+            Some(only) => only.location(),
+            None => intended,
+        }
+    }
+
+    /// Keys held by several sources with differing values, each listing every source it
+    /// was found in.
+    pub fn conflicts(&self) -> Vec<MetaConflict> {
+        let mut seen: std::collections::BTreeMap<&str, Vec<(MetaLocation, &toml::Value)>> =
+            Default::default();
+        for source in &self.sources {
+            let Some(table) = source.metadata().and_then(|m| m.value.as_table()) else {
+                continue;
+            };
+            for (key, value) in table {
+                seen.entry(key).or_default().push((source.location(), value));
+            }
+        }
+        seen.into_iter()
+            .filter(|(_, found)| found.iter().any(|(_, v)| *v != found[0].1))
+            .map(|(key, found)| MetaConflict {
+                key: key.to_string(),
+                locations: found.into_iter().map(|(l, _)| l).collect(),
+            })
+            .collect()
+    }
+
+    /// Every parsed source merged into one table, later locations winning.
+    /// `Ok(None)` when there is nothing parsed to merge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a source parsed to something other than a table.
+    pub fn merged(&self) -> anyhow::Result<Option<Metadata>> {
+        let mut out = toml::Table::new();
+        let mut any = false;
+        for source in &self.sources {
+            let Some(m) = source.metadata() else { continue };
+            let table = m.value.as_table().ok_or_else(|| {
+                anyhow!("Metadata at {:?} is not a table", source.location())
+            })?;
+            for (key, value) in table {
+                out.insert(key.clone(), value.clone());
+            }
+            any = true;
+        }
+        Ok(any.then(|| Metadata { value: toml::Value::Table(out) }))
+    }
+
+    pub fn get_str(&self, key: &str) -> anyhow::Result<Option<String>> {
+        match self.merged()? {
+            Some(m) => m.get_str(key),
+            None => Ok(None),
+        }
+    }
+
+    pub fn get_vec_of_string(&self, key: &str) -> anyhow::Result<Option<Vec<String>>> {
+        match self.merged()? {
+            Some(m) => m.get_vec_of_string(key),
+            None => Ok(None),
+        }
     }
 }
 
@@ -985,6 +1214,187 @@ mod common {
             },
         ).unwrap();
         loader
+    }
+}
+
+#[cfg(test)]
+mod meta_tests {
+    use super::*;
+    use crate::placement::MetaLocation;
+
+    /// Builds a source the way the loader will: parse the text, and on failure keep it
+    /// verbatim alongside the real parse error.
+    fn source(origin: MetaOrigin, raw: &str) -> MetaSource {
+        let state = match toml::from_str::<toml::Value>(raw) {
+            Ok(value) => MetaState::Parsed(Metadata { value }),
+            Err(e) => MetaState::Malformed { raw: raw.to_string(), error: e.to_string() },
+        };
+        MetaSource { origin, state }
+    }
+
+    fn header(raw: &str) -> MetaSource {
+        source(MetaOrigin::Header { header_type: HeaderType::Toml, separator: None }, raw)
+    }
+
+    fn parallel(raw: &str) -> MetaSource {
+        source(MetaOrigin::ParallelSidecar, raw)
+    }
+
+    /// §4.5: an entity with no metadata anywhere.
+    #[test]
+    fn no_sources_is_no_metadata() {
+        let m = EntityMeta::default();
+        assert!(m.is_none());
+        assert!(m.merged().unwrap().is_none());
+        assert_eq!(m.get_str("type").unwrap(), None);
+    }
+
+    /// §4.5: the ordinary case — one source, read straight through.
+    #[test]
+    fn a_single_source_reads_straight_through() {
+        let m = EntityMeta::of(vec![parallel("type = \"T\"")]);
+        assert!(m.single().is_some());
+        assert_eq!(m.get_str("type").unwrap().as_deref(), Some("T"));
+        assert_eq!(m.location_of("type"), Some(MetaLocation::ParallelSidecar));
+        assert!(m.conflicts().is_empty());
+    }
+
+    /// A front-matter source remembers how it was written, so a save reproduces the
+    /// block byte for byte rather than normalising YAML to TOML. §4.5.
+    #[test]
+    fn an_in_header_source_remembers_its_front_matter_shape() {
+        let m = EntityMeta::of(vec![source(
+            MetaOrigin::Header {
+                header_type: HeaderType::Yaml,
+                separator: Some("\n".to_string()),
+            },
+            "type = \"T\"",
+        )]);
+        match &m.single().unwrap().origin {
+            MetaOrigin::Header { header_type, separator } => {
+                assert_eq!(*header_type, HeaderType::Yaml);
+                assert_eq!(separator.as_deref(), Some("\n"));
+            }
+            other => panic!("expected a header origin, got {:?}", other),
+        }
+        // A sidecar has no such shape to remember — the type makes that unrepresentable.
+        assert_eq!(m.locations(), vec![MetaLocation::InHeader]);
+    }
+
+    /// D2: keys from different sources merge, and each key remembers which source holds
+    /// it — which is what lets §4.5 write an update back to the file it came from.
+    #[test]
+    fn disjoint_keys_merge_and_each_remembers_its_source() {
+        let m = EntityMeta::of(vec![header("type = \"T\""), parallel("word_count = 12")]);
+
+        let merged = m.merged().unwrap().unwrap();
+        assert_eq!(merged.get_str("type").unwrap().as_deref(), Some("T"));
+        assert_eq!(merged.value.get("word_count").and_then(|v| v.as_integer()), Some(12));
+
+        for (key, expected) in [
+            ("type", Some(MetaLocation::InHeader)),
+            ("word_count", Some(MetaLocation::ParallelSidecar)),
+            ("absent", None),
+        ] {
+            assert_eq!(m.location_of(key), expected, "location of {:?}", key);
+        }
+        assert!(m.conflicts().is_empty());
+    }
+
+    /// D2: two sources holding the same key agree or they don't. Only disagreement is a
+    /// conflict — the default policy makes that an error (§9.1).
+    #[test]
+    fn a_shared_key_conflicts_only_when_the_values_differ() {
+        for (in_header, in_sidecar, expected) in [
+            ("type = \"T\"", "type = \"T\"", vec![]),
+            ("type = \"A\"", "type = \"B\"", vec!["type"]),
+            ("type = \"A\"\nn = 1", "type = \"A\"\nn = 2", vec!["n"]),
+        ] {
+            let m = EntityMeta::of(vec![header(in_header), parallel(in_sidecar)]);
+            let conflicts = m.conflicts();
+            let keys: Vec<&str> = conflicts.iter().map(|c| c.key.as_str()).collect();
+            assert_eq!(keys, expected, "{:?} against {:?}", in_header, in_sidecar);
+        }
+    }
+
+    /// §4.5: a conflict names every source holding the key, so a caller can repair it.
+    /// The merge still resolves, by `MetaLocation` order — reachable only when the
+    /// policy downgrades the finding below `Error`.
+    #[test]
+    fn a_conflict_names_its_sources_and_resolves_by_location_order() {
+        let m = EntityMeta::of(vec![header("type = \"A\""), parallel("type = \"B\"")]);
+        let conflicts = m.conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].key, "type");
+        assert_eq!(
+            conflicts[0].locations,
+            vec![MetaLocation::InHeader, MetaLocation::ParallelSidecar]
+        );
+        let merged = m.merged().unwrap().unwrap();
+        assert_eq!(merged.get_str("type").unwrap().as_deref(), Some("B"), "later location wins");
+    }
+
+    /// Merge precedence is a property of the locations, not of the order the loader
+    /// happened to probe them in.
+    #[test]
+    fn construction_order_does_not_change_the_result() {
+        assert_eq!(
+            EntityMeta::of(vec![header("type = \"A\""), parallel("type = \"B\"")]),
+            EntityMeta::of(vec![parallel("type = \"B\""), header("type = \"A\"")])
+        );
+    }
+
+    /// §4.5: where a write lands. A key that already exists never moves; a key new to
+    /// this node goes to its only source, or to the layout's intent when there is a
+    /// choice to be made. Each row is asserted in both source orders, because two
+    /// `EntityMeta` that compare equal must also behave alike.
+    #[test]
+    fn a_write_lands_on_the_source_owning_the_key_or_else_on_intent() {
+        let intended = MetaLocation::InsideSidecar;
+        for (sources, key, expected) in [
+            (vec![], "anything", MetaLocation::InsideSidecar),
+            // One established source takes new keys too — §4.3 step 2.
+            (vec![parallel("n = 1")], "n", MetaLocation::ParallelSidecar),
+            (vec![parallel("n = 1")], "new", MetaLocation::ParallelSidecar),
+            // With two, an existing key stays put...
+            (vec![header("t = \"T\""), parallel("n = 1")], "t", MetaLocation::InHeader),
+            (vec![header("t = \"T\""), parallel("n = 1")], "n", MetaLocation::ParallelSidecar),
+            // ...and only a genuinely new key falls through to intent.
+            (vec![header("t = \"T\""), parallel("n = 1")], "new", MetaLocation::InsideSidecar),
+        ] {
+            let reversed: Vec<MetaSource> = sources.iter().rev().cloned().collect();
+            let label = format!("{:?} in {} sources", key, sources.len());
+            assert_eq!(
+                EntityMeta::of(sources).write_location(key, intended),
+                expected,
+                "{}", label
+            );
+            assert_eq!(
+                EntityMeta::of(reversed).write_location(key, intended),
+                expected,
+                "{}, reversed", label
+            );
+        }
+    }
+
+    /// D3 / C10: a source that does not parse keeps its raw text and its error, and does
+    /// not take the other source's keys down with it. Previously the parse error
+    /// propagated and the whole entity failed to load.
+    #[test]
+    fn a_malformed_source_is_retained_beside_a_good_one() {
+        let m = EntityMeta::of(vec![
+            parallel("this is not = = toml"),
+            header("type = \"T\""),
+        ]);
+        assert!(!m.is_none(), "a file that exists but does not parse is still metadata");
+
+        let bad = m.malformed();
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0].location(), MetaLocation::ParallelSidecar);
+        assert_eq!(bad[0].raw(), Some("this is not = = toml"), "kept verbatim for repair");
+        assert!(bad[0].error().is_some(), "and the parse error with it");
+
+        assert_eq!(m.get_str("type").unwrap().as_deref(), Some("T"), "the good source still reads");
     }
 }
 
@@ -1096,7 +1506,7 @@ mod entity_tests {
         assert_eq!(e.path, entity_path);
         assert_eq!(
             e.metadata,
-            EntityMeta::Inside(Metadata {
+            EntityMeta::inside(Metadata {
                 value: toml::from_str("bar=\"foo\"\n").unwrap()
             })
         );
@@ -1121,7 +1531,7 @@ mod entity_tests {
         assert_eq!(e.path, entity_path);
         assert_eq!(
             e.metadata,
-            EntityMeta::Parallel(Metadata {
+            EntityMeta::parallel(Metadata {
                 value: toml::from_str("bar=\"foo\"\n").unwrap()
             })
         );
@@ -1485,7 +1895,7 @@ mod entity_tests {
             content: EntityContent::inside(content.to_string()),
             children: vec![],
             path: entity_path,
-            metadata: EntityMeta::None,
+            metadata: EntityMeta::default(),
             node_type: String::from("TestType"),
         };
         let writer = EntityWriter {};
@@ -1511,7 +1921,7 @@ mod entity_tests {
             content: EntityContent::parallel(content.to_string()),
             children: vec![],
             path: entity_path,
-            metadata: EntityMeta::None,
+            metadata: EntityMeta::default(),
             node_type: String::from("TestType"),
         };
         let writer = EntityWriter {};
@@ -1536,7 +1946,7 @@ mod entity_tests {
             content: EntityContent::None,
             children: vec![],
             path: entity_path,
-            metadata: EntityMeta::Inside(metadata),
+            metadata: EntityMeta::inside(metadata),
             node_type: String::from("TestType"),
         };
         let writer = EntityWriter {};
@@ -1567,21 +1977,21 @@ mod entity_tests {
             content: EntityContent::inside("Child 1 content".to_string()),
             children: vec![],
             path: entity_path.extend_slash("child1"),
-            metadata: EntityMeta::None,
+            metadata: EntityMeta::default(),
             node_type: String::from("ChildTestType"),
         };
         let child2 = Entity {
             content: EntityContent::inside("Child 2 content".to_string()),
             children: vec![],
             path: entity_path.extend_slash("child2"),
-            metadata: EntityMeta::None,
+            metadata: EntityMeta::default(),
             node_type: String::from("ChildTestType"),
         };
         let entity = Entity {
             content: EntityContent::None,
             children: vec![child1, child2],
             path: entity_path,
-            metadata: EntityMeta::None,
+            metadata: EntityMeta::default(),
             node_type: String::from("TestType"),
         };
         let writer = EntityWriter {};
@@ -1622,21 +2032,21 @@ mod entity_tests {
             content: EntityContent::parallel("Child 1 content".to_string()),
             children: vec![],
             path: entity_path.extend_dot("child1"),
-            metadata: EntityMeta::None,
+            metadata: EntityMeta::default(),
             node_type: String::from("ChildTestType"),
         };
         let child2 = Entity {
             content: EntityContent::parallel("Child 2 content".to_string()),
             children: vec![],
             path: entity_path.extend_dot("child2"),
-            metadata: EntityMeta::None,
+            metadata: EntityMeta::default(),
             node_type: String::from("ChildTestType"),
         };
         let entity = Entity {
             content: EntityContent::None,
             children: vec![child1, child2],
             path: entity_path,
-            metadata: EntityMeta::None,
+            metadata: EntityMeta::default(),
             node_type: String::from("TestType"),
         };
         let writer = EntityWriter {};
@@ -1666,18 +2076,30 @@ mod entity_tests {
         (load_entity(&fs, "foo", "entity1"), fs)
     }
 
+    /// Destructures the in-header source, failing with what was actually there.
+    fn header_source(meta: &EntityMeta) -> (&Metadata, Option<&str>, HeaderType) {
+        let Some(source) = meta.source_at(MetaLocation::InHeader) else {
+            panic!("Expected InHeader metadata, got {:?}", meta);
+        };
+        let MetaOrigin::Header { header_type, separator } = &source.origin else {
+            unreachable!("source_at(InHeader) returned a non-header origin")
+        };
+        (
+            source.metadata().expect("header metadata parsed"),
+            separator.as_deref(),
+            *header_type,
+        )
+    }
+
     fn check_header_meta(
         meta: &EntityMeta,
         key: &str,
         expected_val: &str,
         expected_sep: Option<&str>,
     ) {
-        if let EntityMeta::InHeader(m, sep, _) = meta {
-            assert_eq!(m.value.get(key).unwrap().as_str().unwrap(), expected_val);
-            assert_eq!(sep.as_deref(), expected_sep);
-        } else {
-            panic!("Expected InHeader metadata, got {:?}", meta);
-        }
+        let (m, sep, _) = header_source(meta);
+        assert_eq!(m.value.get(key).unwrap().as_str().unwrap(), expected_val);
+        assert_eq!(sep, expected_sep);
     }
 
     #[test]
@@ -1696,8 +2118,9 @@ mod entity_tests {
         check_header_meta(&e.metadata, "foo", "bar", Some("\n---\n"));
     }
 
+    /// D2: a header beside a sidecar is no longer refused — both sources load and merge.
     #[test]
-    fn test_load_entity_conflict_header_and_meta_toml() {
+    fn test_load_entity_merges_header_and_meta_toml() {
         let content = "```toml\nfoo = \"bar\"\n```\nActual content";
         let mut fs = mockfs::MockFS::new();
         create_file_with_content(&mut fs, "foo", "entity1.md", content);
@@ -1705,12 +2128,18 @@ mod entity_tests {
 
         let loader = dummy_loader();
         let entity_path = EntityPath::empty().extend_slash("entity1");
-        let result = loader.try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType");
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Multiple metadata sources"));
+        let e = loader
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            e.metadata.locations(),
+            vec![MetaLocation::InHeader, MetaLocation::ParallelSidecar]
+        );
+        assert_eq!(e.metadata.get_str("foo").unwrap().as_deref(), Some("bar"));
+        assert_eq!(e.metadata.get_str("other").unwrap().as_deref(), Some("meta"));
+        assert!(e.metadata.conflicts().is_empty());
     }
 
     #[test]
@@ -1718,13 +2147,10 @@ mod entity_tests {
         let content = "---\nfoo: bar\n---\n\nActual content";
         let (e, _) = setup_and_load(content);
         assert_eq!(e.content, EntityContent::parallel("\nActual content"));
-        if let EntityMeta::InHeader(m, sep, h) = &e.metadata {
-            assert_eq!(m.value.get("foo").unwrap().as_str().unwrap(), "bar");
-            assert_eq!(sep.as_ref(), None);
-            assert_eq!(*h, HeaderType::Yaml);
-        } else {
-            panic!("Expected InHeader metadata, got {:?}", e.metadata);
-        }
+        let (m, sep, header_type) = header_source(&e.metadata);
+        assert_eq!(m.value.get("foo").unwrap().as_str().unwrap(), "bar");
+        assert_eq!(sep, None);
+        assert_eq!(header_type, HeaderType::Yaml);
     }
 
     #[test]
@@ -1732,12 +2158,9 @@ mod entity_tests {
         let content = "---  \nfoo: bar\n--- \t\n\nActual content";
         let (e, _) = setup_and_load(content);
         assert_eq!(e.content, EntityContent::parallel("\nActual content"));
-        if let EntityMeta::InHeader(m, _, h) = &e.metadata {
-            assert_eq!(m.value.get("foo").unwrap().as_str().unwrap(), "bar");
-            assert_eq!(*h, HeaderType::Yaml);
-        } else {
-            panic!("Expected InHeader metadata, got {:?}", e.metadata);
-        }
+        let (m, _, header_type) = header_source(&e.metadata);
+        assert_eq!(m.value.get("foo").unwrap().as_str().unwrap(), "bar");
+        assert_eq!(header_type, HeaderType::Yaml);
     }
 
     #[test]

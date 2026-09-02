@@ -7,7 +7,11 @@ use inscenerator_xfs::Xfs;
 
 use std::io::Write;
 
-use crate::entity::{EntityPath, EntityPathEntry, EntityContent, EntityMeta, Metadata, utils};
+use crate::entity::{
+    utils, EntityContent, EntityMeta, EntityPath, EntityPathEntry, Metadata, MetaOrigin,
+    MetaSource, MetaState,
+};
+use crate::placement::MetaLocation;
 use crate::schema::{ChildMatch, Schema};
 
 /// Shared context for a tree of LiveEntities.
@@ -111,10 +115,10 @@ impl ChildBuilder {
     /// Sets metadata from an [`EntityMeta`] value.
     ///
     /// The layout (Inside, Parallel, InHeader) is taken from the variant.
-    /// `EntityMeta::None` clears any previously set metadata.
+    /// `EntityMeta::default()` clears any previously set metadata.
     /// Last call wins.
     pub fn with_metadata(mut self, meta: EntityMeta) -> Self {
-        if matches!(meta, EntityMeta::None) {
+        if meta.is_none() {
             self.metadata = None;
         } else {
             self.metadata = Some(meta);
@@ -126,7 +130,7 @@ impl ChildBuilder {
     ///
     /// Last call wins.
     pub fn with_metadata_inside(mut self, meta: Metadata) -> Self {
-        self.metadata = Some(EntityMeta::Inside(meta));
+        self.metadata = Some(EntityMeta::inside(meta));
         self
     }
 
@@ -134,7 +138,7 @@ impl ChildBuilder {
     ///
     /// Last call wins.
     pub fn with_metadata_parallel(mut self, meta: Metadata) -> Self {
-        self.metadata = Some(EntityMeta::Parallel(meta));
+        self.metadata = Some(EntityMeta::parallel(meta));
         self
     }
 
@@ -252,11 +256,7 @@ impl ChildBuilder {
         // For Auto-override with metadata provided, validate it's a Table
         if is_auto_override {
             if let Some(ref meta) = self.metadata {
-                let meta_value = match meta {
-                    EntityMeta::Inside(m) | EntityMeta::Parallel(m) => Some(&m.value),
-                    EntityMeta::InHeader(m, _, _) => Some(&m.value),
-                    EntityMeta::None => None,
-                };
+                let meta_value = meta.single().and_then(|s| s.metadata()).map(|m| &m.value);
                 if let Some(v) = meta_value {
                     if !v.is_table() {
                         bail!("Metadata value must be a TOML table to merge 'type' key");
@@ -267,25 +267,11 @@ impl ChildBuilder {
 
         // Merge type key into existing metadata for Auto-override
         if is_auto_override && self.metadata.is_some() {
-            match &mut self.metadata {
-                Some(EntityMeta::Inside(m)) | Some(EntityMeta::Parallel(m)) => {
-                    if let toml::Value::Table(ref mut table) = m.value {
-                        table.insert(
-                            "type".to_string(),
-                            toml::Value::String(resolved_type.clone()),
-                        );
-                    }
-                    // (Table check already done above — if not a Table, we already bailed)
+            // (Table check already done above — if not a Table, we already bailed.)
+            if let Some(m) = self.metadata.as_mut().and_then(EntityMeta::single_parsed_mut) {
+                if let toml::Value::Table(ref mut table) = m.value {
+                    table.insert("type".to_string(), toml::Value::String(resolved_type.clone()));
                 }
-                Some(EntityMeta::InHeader(m, _, _)) => {
-                    if let toml::Value::Table(ref mut table) = m.value {
-                        table.insert(
-                            "type".to_string(),
-                            toml::Value::String(resolved_type.clone()),
-                        );
-                    }
-                }
-                _ => {}
             }
         }
 
@@ -346,7 +332,7 @@ impl ChildBuilder {
         }
 
         // InHeader metadata requires content
-        if let Some(EntityMeta::InHeader(_, _, _)) = &self.metadata {
+        if self.metadata.as_ref().and_then(|m| m.source_at(MetaLocation::InHeader)).is_some() {
             if self.content_text.is_none() {
                 bail!("InHeader metadata requires content to be set via with_content()");
             }
@@ -385,7 +371,11 @@ impl ChildBuilder {
 
         // --- Content write ---
         // Skip plain content write when InHeader is used (written together with header below)
-        let is_inheader = matches!(&self.metadata, Some(EntityMeta::InHeader(_, _, _)));
+        let is_inheader = self
+            .metadata
+            .as_ref()
+            .and_then(|m| m.source_at(MetaLocation::InHeader))
+            .is_some();
         if let Some(ref text) = self.content_text {
             if !is_inheader {
                 let mut fs = self.root.fs.lock().unwrap();
@@ -398,39 +388,33 @@ impl ChildBuilder {
 
         // --- Metadata write ---
         if !auto_type_written {
-            if let Some(ref meta) = self.metadata {
-                match meta {
-                    EntityMeta::Inside(m) => {
-                        let path = own_disk_path.join("meta.toml");
-                        let toml_str = toml::to_string(&m.value)?;
-                        let mut fs = self.root.fs.lock().unwrap();
-                        if let Some(p) = path.parent() {
-                            fs.create_dir_all(p)?;
-                        }
-                        fs.writer(&path)?.write_all(toml_str.as_bytes())?;
+            for source in self.metadata.iter().flat_map(EntityMeta::sources) {
+                let Some(m) = source.metadata() else { continue };
+                let (path, text) = match &source.origin {
+                    MetaOrigin::InsideSidecar => {
+                        (own_disk_path.join("meta.toml"), toml::to_string(&m.value)?)
                     }
-                    EntityMeta::Parallel(m) => {
-                        let path = own_disk_path.with_added_extension("meta.toml");
-                        let toml_str = toml::to_string(&m.value)?;
-                        let mut fs = self.root.fs.lock().unwrap();
-                        if let Some(p) = path.parent() {
-                            fs.create_dir_all(p)?;
-                        }
-                        fs.writer(&path)?.write_all(toml_str.as_bytes())?;
-                    }
-                    EntityMeta::InHeader(m, sep, header_type) => {
+                    MetaOrigin::ParallelSidecar => (
+                        own_disk_path.with_added_extension("meta.toml"),
+                        toml::to_string(&m.value)?,
+                    ),
+                    MetaOrigin::Header { header_type, separator } => {
                         // Content is guaranteed to be present (checked above)
-                        let text = self.content_text.as_deref().unwrap_or("");
-                        let header = utils::format_metadata_header(m, *header_type, sep.as_deref(), text)?;
-                        let full_content = header + text;
-                        let mut fs = self.root.fs.lock().unwrap();
-                        if let Some(p) = content_path.parent() {
-                            fs.create_dir_all(p)?;
-                        }
-                        fs.writer(&content_path)?.write_all(full_content.as_bytes())?;
+                        let body = self.content_text.as_deref().unwrap_or("");
+                        let header = utils::format_metadata_header(
+                            m,
+                            *header_type,
+                            separator.as_deref(),
+                            body,
+                        )?;
+                        (content_path.clone(), header + body)
                     }
-                    EntityMeta::None => {} // filtered in with_metadata
+                };
+                let mut fs = self.root.fs.lock().unwrap();
+                if let Some(p) = path.parent() {
+                    fs.create_dir_all(p)?;
                 }
+                fs.writer(&path)?.write_all(text.as_bytes())?;
             }
         }
 
@@ -505,7 +489,7 @@ impl LiveEntity {
         }
 
         let meta = self.metadata()?;
-        let m = meta.metadata().ok_or_else(|| {
+        let m = meta.merged()?.ok_or_else(|| {
             anyhow::anyhow!(
                 "Entity at {:?} has Auto type but no metadata",
                 self.on_disk_path()
@@ -595,7 +579,7 @@ impl LiveEntity {
 
         let content = if let Some(c) = content_str {
             let (_, a) = utils::parse_header(&c)
-                .map(|(m, s, a, h)| (Some(EntityMeta::InHeader(m, s, h)), a))
+                .map(|(m, s, a, h)| (Some((m, s, h)), a))
                 .unwrap_or((None, c));
             if is_parallel {
                 EntityContent::Parallel(a)
@@ -621,7 +605,10 @@ impl LiveEntity {
         let (content_str, _, _) = self.get_content_info()?;
 
         let metadata_from_content = content_str.and_then(|c| {
-            utils::parse_header(&c).map(|(m, s, _, h)| EntityMeta::InHeader(m, s, h))
+            utils::parse_header(&c).map(|(m, separator, _, header_type)| MetaSource {
+                origin: MetaOrigin::Header { header_type, separator },
+                state: MetaState::Parsed(m),
+            })
         });
 
         // 2. Try loading from meta.toml files
@@ -639,23 +626,24 @@ impl LiveEntity {
 
         let mut meta_sources = Vec::new();
         if let Some(m) = dot_metadata {
-            meta_sources.push(EntityMeta::Parallel(m));
+            meta_sources.push(MetaSource {
+                origin: MetaOrigin::ParallelSidecar,
+                state: MetaState::Parsed(m),
+            });
         }
         if let Some(m) = slash_metadata {
-            meta_sources.push(EntityMeta::Inside(m));
+            meta_sources.push(MetaSource {
+                origin: MetaOrigin::InsideSidecar,
+                state: MetaState::Parsed(m),
+            });
         }
         if let Some(m) = metadata_from_content {
             meta_sources.push(m);
         }
 
-        if meta_sources.len() > 1 {
-            bail!(
-                "Multiple metadata sources found for entity at {:?}.",
-                self.on_disk_path()
-            );
-        }
-
-        Ok(meta_sources.into_iter().next().unwrap_or(EntityMeta::None))
+        // Several sources merge per key (D2); the ambiguity becomes a finding in Task 8
+        // rather than a refusal here.
+        Ok(EntityMeta::of(meta_sources))
     }
 
     /// Returns handles to the children of this entity as defined by the schema.
@@ -725,8 +713,17 @@ impl LiveEntity {
         let (content_str, _is_parallel, path) = self.get_content_info()?;
 
         let mut to_write = String::new();
-        if let EntityMeta::InHeader(m, sep, header_type) = current_meta {
-            to_write.push_str(&utils::format_metadata_header(&m, header_type, sep.as_deref(), new_content)?);
+        if let Some(source) = current_meta.source_at(MetaLocation::InHeader) {
+            if let (MetaOrigin::Header { header_type, separator }, Some(m)) =
+                (&source.origin, source.metadata())
+            {
+                to_write.push_str(&utils::format_metadata_header(
+                    m,
+                    *header_type,
+                    separator.as_deref(),
+                    new_content,
+                )?);
+            }
         }
         to_write.push_str(new_content);
 
@@ -763,8 +760,8 @@ impl LiveEntity {
 
         let mut fs = self.root.fs.lock().unwrap();
 
-        if let EntityMeta::InHeader(_, _, _) = current_meta {
-            if !matches!(meta, EntityMeta::InHeader(_, _, _)) {
+        if current_meta.source_at(MetaLocation::InHeader).is_some() {
+            if meta.source_at(MetaLocation::InHeader).is_none() {
                 if let Some(c) = &content_str {
                      let a = match utils::parse_header(&c) {
                          Some((_, _, a, _)) => a,
@@ -776,46 +773,68 @@ impl LiveEntity {
             }
         }
 
-        match meta {
-            EntityMeta::None => {
-                if let EntityMeta::Parallel(_) = current_meta {
+        // Any sidecar the node had but the new metadata does not is removed.
+        for location in current_meta.locations() {
+            if meta.source_at(location).is_some() {
+                continue;
+            }
+            match location {
+                MetaLocation::InHeader => {}
+                MetaLocation::ParallelSidecar => {
                     let _ = fs.remove_file(&self.dot_metadata_path());
-                } else if let EntityMeta::Inside(_) = current_meta {
+                }
+                MetaLocation::InsideSidecar => {
                     let _ = fs.remove_file(&self.slash_metadata_path());
                 }
             }
-            EntityMeta::Parallel(m) => {
-                let toml_str = toml::to_string(&m.value)?;
-                let path = self.dot_metadata_path();
-                if let Some(parent) = path.parent() {
-                    fs.create_dir_all(parent)?;
-                }
-                fs.writer(&path)?.write_all(toml_str.as_bytes())?;
-            }
-            EntityMeta::Inside(m) => {
-                let toml_str = toml::to_string(&m.value)?;
-                let path = self.slash_metadata_path();
-                fs.create_dir_all(path.parent().unwrap())?;
-                fs.writer(&path)?.write_all(toml_str.as_bytes())?;
-            }
-            EntityMeta::InHeader(m, sep, header_type) => {
-                let content_body = current_content.content().unwrap_or("");
-                let to_write = utils::format_metadata_header(&m, header_type, sep.as_deref(), content_body)? + content_body;
+        }
 
-                let final_path = if current_content.is_none() {
-                     if self.path.entries.is_empty() {
-                         self.slash_content_path()
-                     } else {
-                         self.dot_content_path()
-                     }
-                } else {
-                    content_path
-                };
-
-                if let Some(parent) = final_path.parent() {
-                    fs.create_dir_all(parent)?;
+        for source in meta.sources() {
+            let Some(m) = source.metadata() else {
+                bail!(
+                    "Refusing to write a metadata source that did not parse at {:?}",
+                    self.on_disk_path()
+                );
+            };
+            match &source.origin {
+                MetaOrigin::ParallelSidecar => {
+                    let toml_str = toml::to_string(&m.value)?;
+                    let path = self.dot_metadata_path();
+                    if let Some(parent) = path.parent() {
+                        fs.create_dir_all(parent)?;
+                    }
+                    fs.writer(&path)?.write_all(toml_str.as_bytes())?;
                 }
-                fs.writer(&final_path)?.write_all(to_write.as_bytes())?;
+                MetaOrigin::InsideSidecar => {
+                    let toml_str = toml::to_string(&m.value)?;
+                    let path = self.slash_metadata_path();
+                    fs.create_dir_all(path.parent().unwrap())?;
+                    fs.writer(&path)?.write_all(toml_str.as_bytes())?;
+                }
+                MetaOrigin::Header { header_type, separator } => {
+                    let content_body = current_content.content().unwrap_or("");
+                    let to_write = utils::format_metadata_header(
+                        m,
+                        *header_type,
+                        separator.as_deref(),
+                        content_body,
+                    )? + content_body;
+
+                    let final_path = if current_content.is_none() {
+                        if self.path.entries.is_empty() {
+                            self.slash_content_path()
+                        } else {
+                            self.dot_content_path()
+                        }
+                    } else {
+                        content_path.clone()
+                    };
+
+                    if let Some(parent) = final_path.parent() {
+                        fs.create_dir_all(parent)?;
+                    }
+                    fs.writer(&final_path)?.write_all(to_write.as_bytes())?;
+                }
             }
         }
         Ok(())
@@ -1096,7 +1115,7 @@ mod tests {
         meta_val.insert("key".to_string(), toml::Value::String("val".to_string()));
         let meta = crate::entity::Metadata { value: toml::Value::Table(meta_val) };
 
-        live.set_metadata(EntityMeta::InHeader(meta, None, HeaderType::Yaml)).unwrap();
+        live.set_metadata(EntityMeta::in_header(meta, None, HeaderType::Yaml)).unwrap();
         live.set_content("Hello").unwrap();
 
         let content = crate::entity::utils::try_load_file_as_string(&*live.root.fs.lock().unwrap(), &PathBuf::from("foo/entity1.md")).unwrap().unwrap();
@@ -1121,12 +1140,17 @@ mod tests {
 
         assert_eq!(live.content().unwrap(), EntityContent::inside("Hello"));
         let meta = live.metadata().unwrap();
-        if let EntityMeta::InHeader(m, sep, _) = meta {
-            assert_eq!(m.value.get("key").unwrap().as_str().unwrap(), "val");
-            assert_eq!(sep.unwrap(), "---\n");
-        } else {
-            panic!("Expected InHeader metadata");
-        }
+        let source = meta
+            .source_at(MetaLocation::InHeader)
+            .expect("Expected InHeader metadata");
+        let MetaOrigin::Header { separator, .. } = &source.origin else {
+            unreachable!()
+        };
+        assert_eq!(
+            source.metadata().unwrap().value.get("key").unwrap().as_str().unwrap(),
+            "val"
+        );
+        assert_eq!(separator.as_deref(), Some("---\n"));
 
         let children = live.children().unwrap();
         assert_eq!(children.len(), 1);
@@ -1154,8 +1178,8 @@ mod tests {
 
         // 2. set_metadata (Inside)
         let meta = crate::entity::Metadata { value: toml::from_str("a = 1").unwrap() };
-        live.set_metadata(EntityMeta::Inside(meta.clone())).unwrap();
-        assert_eq!(live.metadata().unwrap(), EntityMeta::Inside(meta));
+        live.set_metadata(EntityMeta::inside(meta.clone())).unwrap();
+        assert_eq!(live.metadata().unwrap(), EntityMeta::inside(meta));
 
         // 3. create_child
         live.create_child(EntityPathEntry::Slash("child1".to_string()))
@@ -1198,7 +1222,7 @@ mod tests {
             schema,
         );
 
-        live.set_metadata(EntityMeta::None).unwrap();
+        live.set_metadata(EntityMeta::default()).unwrap();
     }
 
     #[test]
@@ -1867,7 +1891,7 @@ mod tests {
         let meta = Metadata { value: toml::from_str("key = \"val\"").unwrap() };
         let err = live
             .create_child(EntityPathEntry::Slash("child".to_string()))
-            .with_metadata(EntityMeta::InHeader(meta, None, crate::entity::HeaderType::Yaml))
+            .with_metadata(EntityMeta::in_header(meta, None, crate::entity::HeaderType::Yaml))
             .build()
             .unwrap_err();
         assert!(err.to_string().contains("InHeader"), "got: {}", err);
