@@ -66,6 +66,130 @@ impl EntityPath {
             EntityPathEntry::Dot(name) => name.as_str(),
         })
     }
+
+    /// Parses the compact string form: `"chapters/ch1.review"` is slash `chapters`,
+    /// slash `ch1`, dot `review`. The empty string is the root.
+    ///
+    /// This is the inverse of the [`Display`](std::fmt::Display) impl, and the string is
+    /// also exactly the entity's stem on disk relative to the base path. The round trip
+    /// is unambiguous only because a name may not contain an interior `.`.
+    ///
+    /// A **leading** `.` belongs to the name — `.gitkeep` is one name, not an empty name
+    /// with a dot-child `gitkeep`. This mirrors [`Path::file_prefix`], which is how
+    /// discovery reads names off disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty segment, an empty dot name, or a name of `.` or `..`.
+    pub fn parse(s: &str) -> anyhow::Result<EntityPath> {
+        fn check(name: &str, whole: &str) -> anyhow::Result<()> {
+            if name.is_empty() {
+                bail!("Empty name in entity path {:?}", whole);
+            }
+            if name == "." || name == ".." {
+                bail!("Invalid name {:?} in entity path {:?}", name, whole);
+            }
+            Ok(())
+        }
+
+        let mut path = EntityPath::empty();
+        if s.is_empty() {
+            return Ok(path);
+        }
+        for segment in s.split('/') {
+            if segment.is_empty() {
+                bail!("Empty segment in entity path {:?}", s);
+            }
+            // The first character is always part of the name, even when it is a '.'.
+            let mut chars = segment.char_indices();
+            chars.next();
+            let (head, tail) = match chars.find(|(_, c)| *c == '.').map(|(i, _)| i) {
+                Some(i) => (&segment[..i], &segment[i..]),
+                None => (segment, ""),
+            };
+            check(head, s)?;
+            path = path.extend_slash(head);
+            if !tail.is_empty() {
+                for name in tail[1..].split('.') {
+                    check(name, s)?;
+                    path = path.extend_dot(name);
+                }
+            }
+        }
+        Ok(path)
+    }
+}
+
+impl std::fmt::Display for EntityPath {
+    /// The compact string form — see [`EntityPath::parse`]. Always uses `/` as the
+    /// separator, so on a platform whose separator differs this is not the same string
+    /// as `local_path().display()`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, entry) in self.entries.iter().enumerate() {
+            match entry {
+                EntityPathEntry::Slash(name) => {
+                    if i > 0 {
+                        f.write_str("/")?;
+                    }
+                    f.write_str(name)?;
+                }
+                EntityPathEntry::Dot(name) => {
+                    f.write_str(".")?;
+                    f.write_str(name)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::str::FromStr for EntityPath {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<EntityPath> {
+        EntityPath::parse(s)
+    }
+}
+
+#[cfg(test)]
+mod entity_path_tests {
+    use super::*;
+
+    /// §1: the compact string form is exactly the entity's stem on disk relative to the
+    /// base, and it round-trips — which holds only because a name has no interior '.'.
+    #[test]
+    fn string_form_is_the_on_disk_stem_and_round_trips() {
+        for spec in [
+            "",
+            "chapters",
+            "chapters/ch1",
+            "chapters/ch1.notes",
+            "chapters/ch1.notes.draft",
+            "chapters/.gitkeep",
+            "a.b/c.d",
+        ] {
+            let path = EntityPath::parse(spec).unwrap();
+            assert_eq!(path.to_string(), spec);
+            assert_eq!(path.local_path(), PathBuf::from(spec), "on-disk stem of {:?}", spec);
+        }
+    }
+
+    /// A leading '.' is part of the name, mirroring `Path::file_prefix` — so `.gitkeep`
+    /// is one child named `.gitkeep`, which is what §7.3 needs a rule to be able to match.
+    #[test]
+    fn a_leading_dot_belongs_to_the_name() {
+        let path = EntityPath::parse("chapters/.gitkeep").unwrap();
+        assert_eq!(path.entries.len(), 2);
+        assert_eq!(path.last_name(), Some(".gitkeep"));
+    }
+
+    /// §1: forms with no valid reading are rejected rather than silently mangled.
+    #[test]
+    fn parse_rejects_forms_with_no_valid_reading() {
+        for bad in ["/a", "a/", "a//b", "a.", "a..b", ".", "..", "a/.."] {
+            assert!(EntityPath::parse(bad).is_err(), "{:?} should not parse", bad);
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
