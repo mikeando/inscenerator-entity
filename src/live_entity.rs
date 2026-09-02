@@ -2,13 +2,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::fmt;
 
-use anyhow::{bail};
+use anyhow::{anyhow, bail};
 use inscenerator_xfs::Xfs;
 
 use std::io::Write;
 
 use crate::entity::{EntityPath, EntityPathEntry, EntityContent, EntityMeta, Metadata, utils};
-use crate::schema::{Schema};
+use crate::schema::{ChildMatch, Schema};
 
 /// Shared context for a tree of LiveEntities.
 pub struct LiveEntityRoot {
@@ -1002,13 +1002,19 @@ impl LiveEntity {
             || self.root.fs.lock().unwrap().is_file(&dot_metadata_path);
 
         let actual_type = self.actual_type()?;
-        let entity_type_descriptor = self.root.schema.get_entity_type(&actual_type)?;
+        let compiled = self.root.schema.compiled(&actual_type)?;
+        // TODO(Task 8): resolve through discovery::resolve_children so that child() and
+        // children() cannot disagree (C2). This preserves today's behaviour meanwhile.
+        let node_type = || match compiled.match_child(name) {
+            ChildMatch::Matched(r) => Ok(r.rule.node_type.clone()),
+            _ => Err(anyhow!("No matching child rule found for {}", name)),
+        };
 
         match (slash_child_exists, dot_child_exists) {
             (true, true) => bail!("Both Slash and Dot child exist with name '{}'", name),
             (true, false) => {
                 let child_path = slash_path;
-                let node_type = entity_type_descriptor.child_type(name)?;
+                let node_type = node_type()?;
                 Ok(LiveEntity {
                     root: self.root.clone(),
                     path: child_path.clone(),
@@ -1017,7 +1023,7 @@ impl LiveEntity {
             },
             (false, true) => {
                 let child_path = dot_path;
-                let node_type = entity_type_descriptor.child_type(name)?;
+                let node_type = node_type()?;
 
                 Ok(LiveEntity {
                     root: self.root.clone(),
@@ -1036,6 +1042,7 @@ mod tests {
     use crate::entity::HeaderType;
     use inscenerator_xfs::mockfs;
     use inscenerator_xfs::XfsReadOnly;
+    use crate::placement::Edge;
     use crate::schema::ChildEntityRules;
     use crate::schema::EntityTypeDescription;
     use std::path::Path;
@@ -1061,11 +1068,13 @@ mod tests {
                 name_regex: ".*".to_string(),
                 node_type: "Type".to_string(),
                 required: false,
+                edge: Edge::Slash,
                 multiple: true,
             }],
             allow_additional: true,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         Arc::new(schema)
     }
 
@@ -1240,8 +1249,9 @@ mod tests {
             name: "Project".to_string(),
             children: vec![],
             allow_additional: true,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         let schema = Arc::new(schema);
 
         let live = LiveEntity::new(
@@ -1328,17 +1338,20 @@ mod tests {
                 name_regex: "^child_".to_string(),
                 node_type: "Child".to_string(),
                 required: false,
+                edge: Edge::Slash,
                 multiple: true,
             }],
             allow_additional: false,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         schema.add_entity_type(EntityTypeDescription {
             name: "Child".to_string(),
             children: vec![],
             allow_additional: false,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         let schema = Arc::new(schema);
 
         let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
@@ -1367,11 +1380,13 @@ mod tests {
                 name_regex: "^child_".to_string(),
                 node_type: "Child".to_string(),
                 required: false,
+                edge: Edge::Slash,
                 multiple: true,
             }],
             allow_additional: false,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         let schema = Arc::new(schema);
 
         let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
@@ -1398,17 +1413,20 @@ mod tests {
                 name_regex: "^child_".to_string(),
                 node_type: "Child".to_string(),
                 required: false,
+                edge: Edge::Slash,
                 multiple: true,
             }],
             allow_additional: false,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         schema.add_entity_type(EntityTypeDescription {
             name: "Child".to_string(),
             children: vec![],
             allow_additional: false,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         let schema = Arc::new(schema);
 
         let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
@@ -1435,8 +1453,9 @@ mod tests {
             name: "Parent".to_string(),
             children: vec![],
             allow_additional: true,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         let schema = Arc::new(schema);
 
         let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
@@ -1461,8 +1480,9 @@ mod tests {
             name: "Parent".to_string(),
             children: vec![],
             allow_additional: true,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         let schema = Arc::new(schema);
 
         let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
@@ -1509,17 +1529,20 @@ mod tests {
                 name_regex: ".*".to_string(),
                 node_type: "Scene".to_string(),
                 required: false,
+                edge: Edge::Slash,
                 multiple: true,
             }],
             allow_additional: false,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         schema.add_entity_type(EntityTypeDescription {
             name: "Scene".to_string(),
             children: vec![],
             allow_additional: false,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         let schema = Arc::new(schema);
 
         let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
@@ -1545,8 +1568,9 @@ mod tests {
             name: "Parent".to_string(),
             children: vec![],
             allow_additional: true,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         let schema = Arc::new(schema);
 
         let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
@@ -1581,11 +1605,13 @@ mod tests {
                 name_regex: ".*".to_string(),
                 node_type: "Type".to_string(),
                 required: false,
+                edge: Edge::Slash,
                 multiple: true,
             }],
             allow_additional: true,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         let schema = Arc::new(schema);
 
         let live = LiveEntity::new(
@@ -1799,8 +1825,9 @@ mod tests {
             name: "Parent".to_string(),
             children: vec![],
             allow_additional: true,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         let schema = Arc::new(schema);
 
         let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
@@ -1886,28 +1913,33 @@ mod tests {
                 name_regex: "^ch_".to_string(),
                 node_type: "Chapter".to_string(),
                 required: false,
+                edge: Edge::Slash,
                 multiple: true,
             }],
             allow_additional: false,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         schema.add_entity_type(EntityTypeDescription {
             name: "Chapter".to_string(),
             children: vec![ChildEntityRules {
                 name_regex: "^sc_".to_string(),
                 node_type: "Scene".to_string(),
                 required: false,
+                edge: Edge::Slash,
                 multiple: true,
             }],
             allow_additional: false,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         schema.add_entity_type(EntityTypeDescription {
             name: "Scene".to_string(),
             children: vec![],
             allow_additional: false,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         let schema = Arc::new(schema);
 
         let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
@@ -1939,11 +1971,13 @@ mod tests {
                 name_regex: ".*".to_string(),
                 node_type: "Auto".to_string(),
                 required: false,
+                edge: Edge::Slash,
                 multiple: true,
             }],
             allow_additional: false,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         let schema = Arc::new(schema);
 
         let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
@@ -1975,17 +2009,20 @@ mod tests {
                 name_regex: "^[0-9]+_".to_string(),
                 node_type: "Chapter".to_string(),
                 required: false,
+                edge: Edge::Slash,
                 multiple: true,
             }],
             allow_additional: false,
+            layout: None,
             ignore: vec!["booker-data".to_string()],
-        });
+        }).unwrap();
         schema.add_entity_type(EntityTypeDescription {
             name: "Chapter".to_string(),
             children: vec![],
             allow_additional: false,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         let schema = Arc::new(schema);
 
         let live = LiveEntity::new(fs, PathBuf::from("project"), EntityPath::empty(), "Project".to_string(), schema);
@@ -2009,17 +2046,20 @@ mod tests {
                 name_regex: "^real-child$".to_string(),
                 node_type: "Child".to_string(),
                 required: false,
+                edge: Edge::Slash,
                 multiple: false,
             }],
             allow_additional: false,
+            layout: None,
             ignore: vec!["booker-data".to_string()],
-        });
+        }).unwrap();
         schema.add_entity_type(EntityTypeDescription {
             name: "Child".to_string(),
             children: vec![],
             allow_additional: false,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
         let schema = Arc::new(schema);
 
         let live = LiveEntity::new(
@@ -2044,8 +2084,9 @@ mod tests {
             name: "Project".to_string(),
             children: vec![],
             allow_additional: false,
+            layout: None,
             ignore: vec!["booker-data".to_string()],
-        });
+        }).unwrap();
         let schema = Arc::new(schema);
 
         let live = LiveEntity::new(fs, PathBuf::from("project"), EntityPath::empty(), "Project".to_string(), schema);

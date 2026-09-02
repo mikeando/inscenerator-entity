@@ -955,6 +955,7 @@ pub fn format_metadata_header(
 #[cfg(test)]
 mod common {
     use super::*;
+    use crate::placement::Edge;
     use crate::schema::ChildEntityRules;
 
     pub fn dummy_loader() -> EntityLoader {
@@ -966,20 +967,23 @@ mod common {
                     name_regex: "^child[0-9]*$".to_string(),
                     node_type: "ChildTestType".to_string(),
                     required: false,
+                    edge: Edge::Slash,
                     multiple: true,
                 }],
                 allow_additional: false,
+                layout: None,
                 ignore: vec![],
             },
-        );
+        ).unwrap();
         loader.schema.add_entity_type(
             EntityTypeDescription {
                 name: "ChildTestType".to_string(),
                 children: vec![],
                 allow_additional: false,
+                layout: None,
                 ignore: vec![],
             },
-        );
+        ).unwrap();
         loader
     }
 }
@@ -988,6 +992,7 @@ mod common {
 mod entity_tests {
 
     use inscenerator_xfs::mockfs;
+    use crate::placement::Edge;
     use crate::schema::ChildEntityRules;
 
     use super::common::*;
@@ -1355,19 +1360,22 @@ mod entity_tests {
                         name_regex: "^[0-9]+_".to_string(),
                         node_type: "Chapter".to_string(),
                         required: false,
+                        edge: Edge::Slash,
                         multiple: true,
                     },
                     ChildEntityRules {
                         name_regex: "^notes$".to_string(),
                         node_type: "Notes".to_string(),
                         required: false,
+                        edge: Edge::Slash,
                         multiple: true,
                     },
                 ],
                 allow_additional: false,
+                layout: None,
                 ignore: vec![],
             },
-        );
+        ).unwrap();
         loader.schema.add_entity_type(
             EntityTypeDescription {
                 name: "Chapter".to_string(),
@@ -1375,20 +1383,23 @@ mod entity_tests {
                     name_regex: "^[0-9]+_".to_string(),
                     node_type: "Scene".to_string(),
                     required: false,
+                    edge: Edge::Slash,
                     multiple: true,
                 }],
                 allow_additional: false,
+                layout: None,
                 ignore: vec![],
             },
-        );
+        ).unwrap();
         loader.schema.add_entity_type(
             EntityTypeDescription {
                 name: "Scene".to_string(),
                 children: vec![],
                 allow_additional: true,
+                layout: None,
                 ignore: vec![],
             },
-        );
+        ).unwrap();
         loader.schema.add_entity_type(
             EntityTypeDescription {
                 name: "Notes".to_string(),
@@ -1396,12 +1407,14 @@ mod entity_tests {
                     name_regex: ".*".to_string(),
                     node_type: "Notes".to_string(),
                     required: false,
+                    edge: Edge::Slash,
                     multiple: true,
                 }],
                 allow_additional: true,
+                layout: None,
                 ignore: vec![],
             },
-        );
+        ).unwrap();
 
         let entity_path = EntityPath::empty();
         let entity = loader
@@ -1907,9 +1920,11 @@ mod entity_tests {
                     name_regex: "^child.*$".to_string(),
                     node_type: "Auto".to_string(),
                     required: false,
+                    edge: Edge::Slash,
                     multiple: true,
                 }],
                 allow_additional: false,
+                layout: None,
                 ignore: vec![],
             },
         );
@@ -1919,6 +1934,7 @@ mod entity_tests {
                 name: "ChildTestType".to_string(),
                 children: vec![],
                 allow_additional: false,
+                layout: None,
                 ignore: vec![],
             },
         );
@@ -1945,6 +1961,7 @@ mod entity_tests {
                 name: "Project".to_string(),
                 children: vec![],
                 allow_additional: true,
+                layout: None,
                 ignore: vec![],
             },
         );
@@ -1971,17 +1988,20 @@ mod entity_tests {
                 name_regex: "^[0-9]+_".to_string(),
                 node_type: "Chapter".to_string(),
                 required: false,
+                edge: Edge::Slash,
                 multiple: true,
             }],
             allow_additional: false,
+            layout: None,
             ignore: vec!["booker-data".to_string()],
-        });
+        }).unwrap();
         loader.schema.add_entity_type(EntityTypeDescription {
             name: "Chapter".to_string(),
             children: vec![],
             allow_additional: false,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
 
         let entity = loader
             .try_load_entity(&fs, &PathBuf::from("project"), &EntityPath::empty(), "Project")
@@ -2005,17 +2025,20 @@ mod entity_tests {
                 name_regex: "^child$".to_string(),
                 node_type: "Child".to_string(),
                 required: false,
+                edge: Edge::Slash,
                 multiple: false,
             }],
             allow_additional: false,
+            layout: None,
             ignore: vec!["booker-data".to_string()],
-        });
+        }).unwrap();
         loader.schema.add_entity_type(EntityTypeDescription {
             name: "Child".to_string(),
             children: vec![],
             allow_additional: false,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
 
         let entity_path = EntityPath::empty().extend_slash("parent");
         let entity = loader
@@ -2041,17 +2064,20 @@ mod entity_tests {
                 name_regex: "^[0-9]+_".to_string(),
                 node_type: "Chapter".to_string(),
                 required: false,
+                edge: Edge::Slash,
                 multiple: true,
             }],
             allow_additional: false,
+            layout: None,
             ignore: vec!["booker-data".to_string(), "cache".to_string()],
-        });
+        }).unwrap();
         loader.schema.add_entity_type(EntityTypeDescription {
             name: "Chapter".to_string(),
             children: vec![],
             allow_additional: false,
+            layout: None,
             ignore: vec![],
-        });
+        }).unwrap();
 
         let entity = loader
             .try_load_entity(&fs, &PathBuf::from("project"), &EntityPath::empty(), "Project")

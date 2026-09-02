@@ -3,6 +3,7 @@
 /// Run with: cargo run --example create_child
 use inscenerator_entity::entity::{EntityPathEntry, Metadata};
 use inscenerator_entity::live_entity::LiveEntity;
+use inscenerator_entity::placement::Edge;
 use inscenerator_entity::schema::{ChildEntityRules, EntityTypeDescription, Schema};
 use inscenerator_xfs::mockfs::MockFS;
 use std::path::PathBuf;
@@ -19,28 +20,33 @@ fn main() -> anyhow::Result<()> {
             name_regex: "^[0-9]+_".to_string(),
             node_type: "Chapter".to_string(),
             required: false,
+            edge: Edge::Slash,
             multiple: true,
         }],
         allow_additional: false,
+        layout: None,
         ignore: vec![],
-    });
+    }).unwrap();
     schema.add_entity_type(EntityTypeDescription {
         name: "Chapter".to_string(),
         children: vec![ChildEntityRules {
             name_regex: ".*".to_string(),
             node_type: "Scene".to_string(),
             required: false,
+            edge: Edge::Slash,
             multiple: true,
         }],
         allow_additional: true,
+        layout: None,
         ignore: vec![],
-    });
+    }).unwrap();
     schema.add_entity_type(EntityTypeDescription {
         name: "Scene".to_string(),
         children: vec![],
         allow_additional: false,
+        layout: None,
         ignore: vec![],
-    });
+    }).unwrap();
     let schema = Arc::new(schema);
 
     let project = LiveEntity::new(
