@@ -72,6 +72,11 @@ pub(crate) fn dot_child_names(
     let Some(entity_dir) = p.parent() else {
         bail!("Entity path {:?} has no parent", p);
     };
+    // A directory that is not there holds no children — the same answer the slash pass
+    // gives, and the one a caller asking about a node it is about to create needs.
+    if !fs.is_dir(entity_dir) {
+        return Ok(BTreeSet::new());
+    }
 
     let mut names = BTreeSet::new();
     let prefix = format!("{}.", p_str);

@@ -363,7 +363,7 @@ pub(crate) mod utils {
             Ok(value) => MetaState::Parsed(Metadata { value }),
             Err(e) => MetaState::Malformed { raw, error: e.to_string() },
         };
-        Ok(Some(MetaSource { origin, state, entity: Some(entity.clone()) }))
+        Ok(Some(MetaSource { origin, state, entity: entity.clone() }))
     }
 
     pub fn split_out_yaml_front_matter(content: &str) -> Option<(String, String)> {
@@ -487,7 +487,7 @@ pub(crate) mod utils {
                 Err(e) => MetaState::Malformed { raw: inner_yaml, error: e.to_string() },
             };
             let origin = MetaOrigin::Header { header_type: HeaderType::Yaml, separator: None };
-            return Some((MetaSource { origin, state, entity: Some(entity.clone()) }, body));
+            return Some((MetaSource { origin, state, entity: entity.clone() }, body));
         }
 
         if let Some((body, inner_toml, separator)) = split_out_toml_front_matter(content) {
@@ -496,7 +496,7 @@ pub(crate) mod utils {
                 Err(e) => MetaState::Malformed { raw: inner_toml, error: e.to_string() },
             };
             let origin = MetaOrigin::Header { header_type: HeaderType::Toml, separator };
-            return Some((MetaSource { origin, state, entity: Some(entity.clone()) }, body));
+            return Some((MetaSource { origin, state, entity: entity.clone() }, body));
         }
 
         None
@@ -868,9 +868,7 @@ pub struct MetaSource {
     /// The entity this source belongs to. With [`Self::location`] it determines the
     /// file, so no path is stored: a path would be derived state, duplicating what
     /// [`crate::placement`] already computes and going stale the moment a node moves.
-    ///
-    /// `None` for a source built in memory for an entity that does not exist yet.
-    pub entity: Option<EntityPath>,
+    pub entity: EntityPath,
 }
 
 impl MetaSource {
@@ -885,20 +883,13 @@ impl MetaSource {
     /// Errors about metadata reach that person, not the programmer calling the library,
     /// so they must name a file rather than a variant of [`MetaLocation`]. The path is
     /// computed here rather than stored, so it cannot disagree with where the file
-    /// actually is. The fallbacks describe the source in the same register.
+    /// actually is.
     pub fn describe(&self) -> String {
-        let Some(entity) = &self.entity else {
-            return match self.origin {
-                MetaOrigin::Header { .. } => "the front matter".to_string(),
-                MetaOrigin::ParallelSidecar => "the sidecar beside the entity".to_string(),
-                MetaOrigin::InsideSidecar => "the sidecar in the entity directory".to_string(),
-            };
-        };
-        match crate::placement::sidecar_path(Path::new(""), entity, self.location()) {
+        match crate::placement::sidecar_path(Path::new(""), &self.entity, self.location()) {
             Some(p) => p.display().to_string(),
             // In-header metadata has no file of its own; it is in whichever file holds
             // the content, which the entity names.
-            None => format!("the front matter of {}", entity.local_path().display()),
+            None => format!("the front matter of {}", self.entity.local_path().display()),
         }
     }
 
@@ -965,14 +956,8 @@ impl EntityMeta {
         EntityMeta::of(vec![MetaSource {
             origin,
             state: MetaState::Parsed(m),
-            entity: Some(entity),
+            entity,
         }])
-    }
-
-    /// A single parsed source for an entity that does not exist yet, so cannot name a
-    /// file. Used while building a child, before its path is settled.
-    pub fn unplaced(origin: MetaOrigin, m: Metadata) -> EntityMeta {
-        EntityMeta::of(vec![MetaSource { origin, state: MetaState::Parsed(m), entity: None }])
     }
 
     pub fn parallel(entity: EntityPath, m: Metadata) -> EntityMeta {
@@ -1001,18 +986,6 @@ impl EntityMeta {
     pub fn single(&self) -> Option<&MetaSource> {
         match self.sources.as_slice() {
             [only] => Some(only),
-            _ => None,
-        }
-    }
-
-    /// The single source's parsed table, mutably — `None` unless there is exactly one
-    /// source and it parsed.
-    pub fn single_parsed_mut(&mut self) -> Option<&mut Metadata> {
-        match self.sources.as_mut_slice() {
-            [only] => match &mut only.state {
-                MetaState::Parsed(m) => Some(m),
-                MetaState::Malformed { .. } => None,
-            },
             _ => None,
         }
     }
@@ -1242,7 +1215,7 @@ mod meta_tests {
             Ok(value) => MetaState::Parsed(Metadata { value }),
             Err(e) => MetaState::Malformed { raw: raw.to_string(), error: e.to_string() },
         };
-        MetaSource { origin, state, entity: Some(EntityPath::empty().extend_slash("ch1")) }
+        MetaSource { origin, state, entity: EntityPath::empty().extend_slash("ch1") }
     }
 
     fn header(raw: &str) -> MetaSource {

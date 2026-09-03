@@ -8,14 +8,14 @@ use inscenerator_xfs::Xfs;
 use std::io::Write;
 
 use crate::entity::{
-    utils, EntityContent, EntityMeta, EntityPath, EntityPathEntry, HeaderType, MetaOrigin,
-    MetaSource, MetaState, Metadata,
+    utils, EntityContent, EntityMeta, EntityPath, HeaderType, MetaOrigin, MetaSource, MetaState,
+    Metadata,
 };
 use crate::discovery;
 use crate::findings::{Finding, FindingKindId, FindingPolicy, FindingSink};
-use crate::placement::{self, ContentLocation, Layout, MetaLocation};
+use crate::placement::{self, ContentLocation, Edge, Layout, MetaLocation};
 use crate::reading;
-use crate::schema::Schema;
+use crate::schema::{ChildMatch, Schema};
 
 /// §4.3 for content: what the node has established wins, and only a node with no content
 /// at all falls back to what its type intends.
@@ -146,34 +146,32 @@ pub struct ObservedPlacement {
     pub metadata: Vec<MetaLocation>,
 }
 
-/// Controls where content is written relative to the entity's disk path.
-#[derive(Debug, Clone)]
-enum ChildContentLayout {
-    /// Layout is chosen automatically: Slash entries use Inside, Dot entries use Parallel.
-    Inferred,
-    /// Content is written inside the entity's directory (`dir/content.md`).
-    Inside,
-    /// Content is written alongside the entity (`name.md`).
-    Parallel,
-}
-
 /// Builder for creating a new child entity on disk.
 ///
-/// Obtain via [`LiveEntity::create_child`]. Call [`build`](ChildBuilder::build) to write to disk.
+/// Obtain via [`LiveEntity::create_child`], which takes only the child's *name*: where it
+/// attaches and where its files go are resolved from the schema (§4.3), not stated by the
+/// caller. [`with_edge`](Self::with_edge) and [`with_layout`](Self::with_layout) override
+/// that resolution for a caller that means to (§8.1).
+///
+/// Call [`build`](ChildBuilder::build) to write to disk.
 #[derive(Debug, Clone)]
+#[must_use = "a ChildBuilder does nothing until build() is called"]
 pub struct ChildBuilder {
     root: Arc<LiveEntityRoot>,
-    /// Logical path of the parent entity.
+    /// Logical path of the parent entity. A nested builder does not know this until its
+    /// parent's edge is resolved, so the parent fills it in at build time.
     parent_path: EntityPath,
     /// Node type of the parent (may be "Auto", resolved via actual_type() at build time).
     parent_node_type: String,
-    entry: EntityPathEntry,
-    /// The layout of the parent instance, passed to the child it builds (§2.1).
+    /// The layout the parent handle inherited, used to resolve the parent's own (§2.1).
     parent_inherited_layout: Layout,
+    name: String,
     node_type_override: Option<String>,
     content_text: Option<String>,
-    content_layout: ChildContentLayout,
-    metadata: Option<EntityMeta>,
+    metadata: Option<Metadata>,
+    metadata_location: Option<MetaLocation>,
+    edge_override: Option<Edge>,
+    layout_override: Option<Layout>,
     nested_children: Vec<ChildBuilder>,
 }
 
@@ -188,87 +186,74 @@ impl ChildBuilder {
         self
     }
 
-    /// Sets the content text, inferring layout from entry type.
+    /// Sets the content text. It is written wherever the resolved layout puts content.
     ///
-    /// Slash entries default to Inside (`dir/content.md`);
-    /// Dot entries default to Parallel (`name.md`).
     /// Last call wins.
     pub fn with_content(mut self, text: &str) -> Self {
         self.content_text = Some(text.to_string());
-        self.content_layout = ChildContentLayout::Inferred;
         self
     }
 
-    /// Sets the content text and forces Inside layout (`dir/content.md`).
+    /// Sets the child's metadata, written wherever the resolved layout puts a sidecar.
     ///
     /// Last call wins.
-    pub fn with_content_inside(mut self, text: &str) -> Self {
-        self.content_text = Some(text.to_string());
-        self.content_layout = ChildContentLayout::Inside;
+    pub fn with_metadata(mut self, meta: Metadata) -> Self {
+        self.metadata = Some(meta);
         self
     }
 
-    /// Sets the content text and forces Parallel layout (`name.md`).
+    /// Sets the child's metadata and the location to write it to, overriding the layout.
     ///
-    /// Last call wins.
-    pub fn with_content_parallel(mut self, text: &str) -> Self {
-        self.content_text = Some(text.to_string());
-        self.content_layout = ChildContentLayout::Parallel;
+    /// [`MetaLocation::InHeader`] requires content, since front matter has to sit above
+    /// something. Last call wins.
+    pub fn with_metadata_at(mut self, location: MetaLocation, meta: Metadata) -> Self {
+        self.metadata = Some(meta);
+        self.metadata_location = Some(location);
         self
     }
 
-    /// Sets metadata from an [`EntityMeta`] value.
+    /// Forces the edge this child attaches on, overriding what the schema resolved.
     ///
-    /// The layout (Inside, Parallel, InHeader) is taken from the variant.
-    /// `EntityMeta::default()` clears any previously set metadata.
-    /// Last call wins.
-    pub fn with_metadata(mut self, meta: EntityMeta) -> Self {
-        if meta.is_none() {
-            self.metadata = None;
-        } else {
-            self.metadata = Some(meta);
-        }
+    /// The exception, not the ordinary path (§8.1): the parent's rule declares the edge,
+    /// and that is what lets a caller create a child without knowing the convention.
+    pub fn with_edge(mut self, edge: Edge) -> Self {
+        self.edge_override = Some(edge);
         self
     }
 
-    /// Sets metadata to be written inside the entity directory (`dir/meta.toml`).
+    /// Forces this child's layout, overriding its type's and what it would inherit.
     ///
-    /// Last call wins.
-    pub fn with_metadata_inside(mut self, meta: Metadata) -> Self {
-        self.metadata = Some(EntityMeta::unplaced(MetaOrigin::InsideSidecar, meta));
-        self
-    }
-
-    /// Sets metadata to be written alongside the entity (`name.meta.toml`).
-    ///
-    /// Last call wins.
-    pub fn with_metadata_parallel(mut self, meta: Metadata) -> Self {
-        self.metadata = Some(EntityMeta::unplaced(MetaOrigin::ParallelSidecar, meta));
+    /// See [`with_edge`](Self::with_edge): also the exception. Layout and edge are
+    /// independent, which is what makes §5's shape expressible at all.
+    pub fn with_layout(mut self, layout: Layout) -> Self {
+        self.layout_override = Some(layout);
         self
     }
 
     /// Adds a nested child builder.
     ///
-    /// The closure receives a fresh [`ChildBuilder`] whose parent path is set to this
-    /// entity's path. Configure it inside the closure and return the result.
-    /// Nested children are built (in order) when [`build`](Self::build) is called.
-    pub fn with_child<F>(mut self, entry: EntityPathEntry, f: F) -> Self
+    /// The closure receives a fresh [`ChildBuilder`] for a child of *this* entity.
+    /// Nested children are built (in order) when [`build`](Self::build) is called, by
+    /// which time this entity's own path is known.
+    pub fn with_child<F>(mut self, name: &str, f: F) -> Self
     where
         F: FnOnce(ChildBuilder) -> ChildBuilder,
     {
-        let own_path = self.parent_path.extend(self.entry.clone());
         let inner = ChildBuilder {
             root: self.root.clone(),
-            parent_path: own_path,
-            parent_inherited_layout: self.parent_inherited_layout,
-            parent_node_type: String::new(), // intentionally unused: nested builders
-                                             // always enter via build_internal(parent_type),
-                                             // never via build() which reads this field
-            entry,
+            // Both are filled in by build_internal, which is the first point at which
+            // this entity's own path and layout are known.
+            parent_path: EntityPath::empty(),
+            parent_inherited_layout: Layout::Inside,
+            parent_node_type: String::new(), // unused: nested builders always enter via
+                                             // build_internal, never via build()
+            name: name.to_string(),
             node_type_override: None,
             content_text: None,
-            content_layout: ChildContentLayout::Inferred,
             metadata: None,
+            metadata_location: None,
+            edge_override: None,
+            layout_override: None,
             nested_children: vec![],
         };
         self.nested_children.push(f(inner));
@@ -277,13 +262,10 @@ impl ChildBuilder {
 
     /// Validates configuration, writes the child entity to disk, and returns a handle to it.
     ///
-    /// For Slash entries this always creates a directory. For Dot entries at least
-    /// one of content, metadata, or nested children must be provided.
-    ///
     /// # Errors
     ///
     /// Returns an error if the child already exists, if the schema rejects the child name
-    /// or type, if InHeader metadata is set without content, or if disk access fails.
+    /// or type, if there would be nothing on disk to show for it, or if disk access fails.
     pub fn build(self) -> anyhow::Result<LiveEntity> {
         let parent_live = LiveEntity {
             root: self.root.clone(),
@@ -292,258 +274,224 @@ impl ChildBuilder {
             inherited_layout: self.parent_inherited_layout,
         };
         let parent_type = parent_live.actual_type()?;
-        self.build_internal(&parent_type)
+        let parent_layout = parent_live.intended_layout()?;
+        self.build_internal(&parent_type, parent_layout)
     }
 
-    fn build_internal(mut self, parent_type: &str) -> anyhow::Result<LiveEntity> {
-        // --- Type resolution ---
-        let child_name = match &self.entry {
-            EntityPathEntry::Slash(n) | EntityPathEntry::Dot(n) => n.as_str(),
+    fn build_internal(self, parent_type: &str, parent_layout: Layout) -> anyhow::Result<LiveEntity> {
+        let parent_ctype = self.root.schema.compiled(parent_type)?;
+
+        // --- Type (§7.1), through the one rule matcher.
+        let (inferred_type, rule_index, declared_edge) = match parent_ctype.match_child(&self.name)
+        {
+            ChildMatch::Matched(r) => {
+                (Some(r.rule.node_type.clone()), Some(r.index), r.rule.edge)
+            }
+            // No rule, so no declared type and no declared edge (§7.2).
+            ChildMatch::Additional => (None, None, Edge::default()),
+            ChildMatch::Ignored => bail!(
+                "Name '{}' is ignored by type '{}', so it cannot be one of its children",
+                self.name,
+                parent_type
+            ),
+            ChildMatch::Unexpected => {
+                bail!("Unexpected child '{}' in entity of type '{}'", self.name, parent_type)
+            }
         };
-
-        let entity_type_descriptor = self.root.schema.get_entity_type(parent_type)?;
-
-        let inferred_type: Option<String> = entity_type_descriptor
-            .children
-            .iter()
-            .find(|rule| {
-                regex::Regex::new(&rule.name_regex)
-                    .map(|re| re.is_match(child_name))
-                    .unwrap_or(false)
-            })
-            .map(|rule| rule.node_type.clone());
 
         let resolved_type = match (&inferred_type, &self.node_type_override) {
-            // Rule matched, no override
             (Some(inferred), None) => inferred.clone(),
-            // Rule matched, override matches
-            (Some(inferred), Some(override_type)) if inferred == override_type => inferred.clone(),
-            // Rule matched "Auto", override provides concrete type
-            (Some(inferred), Some(override_type)) if inferred == "Auto" => override_type.clone(),
-            // Rule matched concrete type, override differs => error
-            (Some(inferred), Some(override_type)) => {
-                bail!(
-                    "Type mismatch: schema inferred '{}' but with_type specified '{}'",
-                    inferred, override_type
-                );
-            }
-            // No rule matched, allow_additional = true, override provided
-            (None, Some(override_type)) if entity_type_descriptor.allow_additional => {
-                override_type.clone()
-            }
-            // No rule matched, allow_additional = true, no override => error
-            (None, None) if entity_type_descriptor.allow_additional => {
-                bail!(
-                    "Child '{}' does not match any schema rule; call with_type() to specify its type",
-                    child_name
-                );
-            }
-            // No rule matched, allow_additional = false => error
-            (None, _) => {
-                bail!("Unexpected child '{}' in entity of type '{}'", child_name, parent_type);
-            }
+            (Some(inferred), Some(overridden)) if inferred == overridden => inferred.clone(),
+            (Some(inferred), Some(overridden)) if inferred == "Auto" => overridden.clone(),
+            (Some(inferred), Some(overridden)) => bail!(
+                "Type mismatch: schema inferred '{}' but with_type specified '{}'",
+                inferred,
+                overridden
+            ),
+            (None, Some(overridden)) => overridden.clone(),
+            (None, None) => bail!(
+                "Child '{}' does not match any schema rule; call with_type() to specify its type",
+                self.name
+            ),
         };
-
-        // If the schema rule explicitly sets node_type = "Auto" but no with_type() was called,
-        // we cannot write a meaningful type — error eagerly rather than deferring to the next read.
-        if resolved_type == "Auto" && self.node_type_override.is_none() {
-            let child_name = match &self.entry {
-                EntityPathEntry::Slash(n) | EntityPathEntry::Dot(n) => n.as_str(),
-            };
+        if resolved_type == "Auto" {
             bail!(
                 "Child '{}' has schema type 'Auto' — call with_type() to specify the concrete type",
-                child_name
+                self.name
             );
         }
+        // A slot the schema did not type has to record its type in the child itself.
+        let is_auto_override = inferred_type.as_deref() == Some("Auto") || inferred_type.is_none();
 
-        // Determine whether this is an Auto-override case
-        let is_auto_override = inferred_type.as_deref() == Some("Auto")
-            || (inferred_type.is_none() && entity_type_descriptor.allow_additional);
+        // --- Edge (§4.3): an override, else the edge this name already sits on, else the
+        // edge this rule's other children have settled on, else the declaration. A rule
+        // already split across both edges is not evidence of anything, so it does not
+        // spread (§4.5) — the declaration wins there.
+        let siblings = {
+            let mut sink = FindingSink::new(FindingPolicy::tolerant());
+            let fs = self.root.fs.lock().unwrap();
+            discovery::resolve_children(
+                &*fs,
+                &self.root.base_path,
+                &self.parent_path,
+                parent_ctype,
+                &mut sink,
+            )?
+        };
+        let edge = match (self.edge_override, siblings.iter().find(|c| c.name == self.name)) {
+            (Some(edge), _) => edge,
+            (None, Some(existing)) => existing.edge,
+            (None, None) => {
+                let established: Vec<Edge> = siblings
+                    .iter()
+                    .filter(|c| rule_index.is_some() && c.rule_index == rule_index)
+                    .map(|c| c.edge)
+                    .collect();
+                let all_on = |e: Edge| !established.is_empty() && established.iter().all(|x| *x == e);
+                if all_on(Edge::Dot) {
+                    Edge::Dot
+                } else if all_on(Edge::Slash) {
+                    Edge::Slash
+                } else {
+                    declared_edge
+                }
+            }
+        };
+        // §3: the root has no filename to prefix, so it has no dot children.
+        if self.parent_path.entries.is_empty() && edge == Edge::Dot {
+            bail!("Root entities may only have Slash children");
+        }
 
-        // For Auto-override with metadata provided, validate it's a Table
+        // --- Layout (§4.3, §2.1): an override, else what the child's type declares, else
+        // the layout of the parent *instance* it is being created under. Independent of
+        // the edge above: coupling them is defect C3.
+        let child_ctype = self.root.schema.compiled(&resolved_type)?;
+        let layout = self
+            .layout_override
+            .or(child_ctype.desc.layout)
+            .unwrap_or(parent_layout);
+
+        let own_path = placement::child_path(&self.parent_path, &self.name, edge);
+        let stem = placement::stem(&self.root.base_path, &own_path);
+
+        // --- Existence. Any trace of this (edge, name) means the child is already there.
+        if let Some(found) = self.existing_trace(&own_path, &stem)? {
+            bail!("Child '{}' already exists at {:?}", self.name, found);
+        }
+
+        // --- Metadata to write, which for an untyped slot includes the type itself.
+        let mut metadata = self.metadata.clone();
         if is_auto_override {
-            if let Some(ref meta) = self.metadata {
-                let meta_value = meta.single().and_then(|s| s.metadata()).map(|m| &m.value);
-                if let Some(v) = meta_value {
-                    if !v.is_table() {
-                        bail!("Metadata value must be a TOML table to merge 'type' key");
-                    }
-                }
-            }
-        }
-
-        // Merge type key into existing metadata for Auto-override
-        if is_auto_override && self.metadata.is_some() {
-            // (Table check already done above — if not a Table, we already bailed.)
-            if let Some(m) = self.metadata.as_mut().and_then(EntityMeta::single_parsed_mut) {
-                if let toml::Value::Table(ref mut table) = m.value {
-                    table.insert("type".to_string(), toml::Value::String(resolved_type.clone()));
-                }
-            }
-        }
-
-        // Root entity may only have Slash children
-        if self.parent_path.entries.is_empty() {
-            if let EntityPathEntry::Dot(_) = &self.entry {
-                bail!("Root entities may only have Slash children");
-            }
-        }
-
-        let own_path = self.parent_path.extend(self.entry.clone());
-        let own_disk_path = own_path.to_pathbuf(&self.root.base_path);
-
-        match &self.entry {
-            EntityPathEntry::Slash(_) => {
-                // Existence check
-                {
-                    let fs = self.root.fs.lock().unwrap();
-                    if fs.is_dir(&own_disk_path) {
-                        bail!("Child already exists at {:?}", own_disk_path);
-                    }
-                }
-                // Create directory
-                self.root.fs.lock().unwrap().create_dir_all(&own_disk_path)?;
-            }
-            EntityPathEntry::Dot(n) => {
-                // Dot child must have content, metadata, or nested children
-                if self.content_text.is_none()
-                    && self.metadata.is_none()
-                    && self.nested_children.is_empty()
-                {
-                    bail!("Dot child '{}' has nothing to write to disk; provide content, metadata, or children", n);
-                }
-
-                // Existence check: .md or .meta.toml files
-                {
-                    let fs_guard = self.root.fs.lock().unwrap();
-                    if fs_guard.is_file(&own_disk_path.with_added_extension("md"))
-                        || fs_guard.is_file(&own_disk_path.with_added_extension("meta.toml"))
-                    {
-                        bail!("Dot child '{}' already exists at {:?}", n, own_disk_path);
-                    }
-                    // Also check for any file in the parent dir that starts with "parent.notes."
-                    let check_dir = own_disk_path.parent().unwrap();
-                    let own_name = own_disk_path.file_name().unwrap().to_str().unwrap();
-                    let dot_prefix = format!("{}.", own_name);
-                    if let Ok(entries) = fs_guard.read_dir(check_dir) {
-                        for entry in entries.flatten() {
-                            if let Some(fname_str) = entry.path().file_name().and_then(|f| f.to_str()) {
-                                if fname_str.starts_with(&dot_prefix) {
-                                    bail!("Dot child '{}' already exists (found {:?})", n, entry.path());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // InHeader metadata requires content
-        if self.metadata.as_ref().and_then(|m| m.source_at(MetaLocation::InHeader)).is_some() {
-            if self.content_text.is_none() {
-                bail!("InHeader metadata requires content to be set via with_content()");
-            }
-        }
-
-        // Write type to metadata for Auto-override (minimal meta.toml when no user metadata provided)
-        let auto_type_written = is_auto_override && self.metadata.is_none();
-        if auto_type_written {
-            let meta_path = match &self.entry {
-                EntityPathEntry::Slash(_) => own_disk_path.join("meta.toml"),
-                EntityPathEntry::Dot(_) => own_disk_path.with_added_extension("meta.toml"),
+            let m = metadata.get_or_insert_with(|| Metadata {
+                value: toml::Value::Table(toml::map::Map::new()),
+            });
+            let toml::Value::Table(table) = &mut m.value else {
+                bail!("Metadata value must be a TOML table to merge 'type' key");
             };
-            let content = format!("type = \"{}\"\n", resolved_type);
-            let mut fs = self.root.fs.lock().unwrap();
-            if let Some(parent) = meta_path.parent() {
-                fs.create_dir_all(parent)?;
-            }
-            fs.writer(&meta_path)?.write_all(content.as_bytes())?;
+            table.insert("type".to_string(), toml::Value::String(resolved_type.clone()));
+        }
+        let meta_location = self.metadata_location.unwrap_or(layout.sidecar_location());
+        if metadata.is_some() && meta_location == MetaLocation::InHeader && self.content_text.is_none()
+        {
+            bail!("InHeader metadata requires content to be set via with_content()");
         }
 
-        let return_node_type = if is_auto_override {
-            "Auto".to_string()
-        } else {
-            resolved_type.clone()
-        };
+        // §6: a node is what it leaves on disk. An inside node's directory is that trace
+        // even when it is empty; a parallel node with nothing to write leaves none.
+        let leaves_nothing =
+            metadata.is_none() && self.content_text.is_none() && self.nested_children.is_empty();
+        if leaves_nothing && layout == Layout::Parallel {
+            bail!(
+                "Child '{}' has nothing to write to disk; provide content, metadata, or children",
+                self.name
+            );
+        }
+        if layout == Layout::Inside {
+            self.root.fs.lock().unwrap().create_dir_all(&stem)?;
+        }
 
-        // Compute the content path (needed for both plain content write and InHeader)
-        let content_layout_used = match self.content_layout {
-            ChildContentLayout::Inside => ContentLocation::Inside,
-            ChildContentLayout::Parallel => ContentLocation::Parallel,
-            ChildContentLayout::Inferred => match &self.entry {
-                EntityPathEntry::Slash(_) => ContentLocation::Inside,
-                EntityPathEntry::Dot(_) => ContentLocation::Parallel,
-            },
-        };
-        let content_path = placement::content_path(&self.root.base_path, &own_path, content_layout_used);
-
-        // --- Content write ---
-        // Skip plain content write when InHeader is used (written together with header below)
-        let is_inheader = self
-            .metadata
-            .as_ref()
-            .and_then(|m| m.source_at(MetaLocation::InHeader))
-            .is_some();
-        if let Some(ref text) = self.content_text {
-            if !is_inheader {
-                let mut fs = self.root.fs.lock().unwrap();
-                if let Some(parent) = content_path.parent() {
-                    fs.create_dir_all(parent)?;
+        // --- Write. Front matter shares the content file, so the two go out together.
+        let mut header = String::new();
+        if let Some(m) = &metadata {
+            match placement::sidecar_path(&self.root.base_path, &own_path, meta_location) {
+                Some(path) => {
+                    write_file(&self.root, &path, &toml::to_string(&m.value)?)?;
                 }
-                fs.writer(&content_path)?.write_all(text.as_bytes())?;
-            }
-        }
-
-        // --- Metadata write ---
-        if !auto_type_written {
-            for source in self.metadata.iter().flat_map(EntityMeta::sources) {
-                let Some(m) = source.metadata() else { continue };
-                let (path, text) = match &source.origin {
-                    MetaOrigin::InsideSidecar => {
-                        (own_disk_path.join("meta.toml"), toml::to_string(&m.value)?)
-                    }
-                    MetaOrigin::ParallelSidecar => (
-                        own_disk_path.with_added_extension("meta.toml"),
-                        toml::to_string(&m.value)?,
-                    ),
-                    MetaOrigin::Header { header_type, separator } => {
-                        // Content is guaranteed to be present (checked above)
-                        let body = self.content_text.as_deref().unwrap_or("");
-                        let header = utils::format_metadata_header(
-                            m,
-                            *header_type,
-                            separator.as_deref(),
-                            body,
-                        )?;
-                        (content_path.clone(), header + body)
-                    }
-                };
-                let mut fs = self.root.fs.lock().unwrap();
-                if let Some(p) = path.parent() {
-                    fs.create_dir_all(p)?;
+                None => {
+                    let body = self.content_text.as_deref().unwrap_or("");
+                    header = utils::format_metadata_header(m, HeaderType::Toml, None, body)?;
                 }
-                fs.writer(&path)?.write_all(text.as_bytes())?;
             }
         }
+        if let Some(text) = &self.content_text {
+            let path = placement::content_path(&self.root.base_path, &own_path, layout.content_location());
+            write_file(&self.root, &path, &(header + text))?;
+        }
 
-        // Build nested children
-        for nested in self.nested_children {
-            nested.build_internal(&resolved_type)?;
+        for mut nested in self.nested_children {
+            nested.parent_path = own_path.clone();
+            nested.build_internal(&resolved_type, layout)?;
         }
 
         Ok(LiveEntity {
             root: self.root,
             path: own_path,
-            // TODO(Task 10): the child's layout is resolved from its type and the parent
-            // instance, not guessed from its edge. Until then this mirrors the layout the
-            // write above used, so a handle reads back what the builder just wrote.
-            node_type: return_node_type,
-            inherited_layout: match content_layout_used {
-                ContentLocation::Inside => Layout::Inside,
-                ContentLocation::Parallel => Layout::Parallel,
-            },
+            node_type: if is_auto_override { "Auto".to_string() } else { resolved_type },
+            // §2.1: a child created under this one inherits *this* one's layout.
+            inherited_layout: layout,
         })
     }
+
+    /// Anything on disk that this (edge, name) already occupies: its directory, either of
+    /// its content files, either of its sidecars, or a dot child hanging off it.
+    fn existing_trace(&self, own_path: &EntityPath, stem: &Path) -> anyhow::Result<Option<PathBuf>> {
+        let base = &self.root.base_path;
+        let fs = self.root.fs.lock().unwrap();
+        if fs.is_dir(stem) {
+            return Ok(Some(stem.to_path_buf()));
+        }
+        for location in [ContentLocation::Parallel, ContentLocation::Inside] {
+            let path = placement::content_path(base, own_path, location);
+            if fs.is_file(&path) {
+                return Ok(Some(path));
+            }
+        }
+        for location in [MetaLocation::ParallelSidecar, MetaLocation::InsideSidecar] {
+            let path = placement::sidecar_path(base, own_path, location)
+                .expect("a sidecar location always has a path");
+            if fs.is_file(&path) {
+                return Ok(Some(path));
+            }
+        }
+        let (Some(dir), Some(name)) = (stem.parent(), stem.file_name().and_then(|n| n.to_str()))
+        else {
+            return Ok(None);
+        };
+        let prefix = format!("{}.", name);
+        if let Ok(entries) = fs.read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_descendant = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&prefix));
+                if is_descendant {
+                    return Ok(Some(path));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Writes `text` to `path`, creating the directories above it.
+fn write_file(root: &LiveEntityRoot, path: &Path, text: &str) -> anyhow::Result<()> {
+    let mut fs = root.fs.lock().unwrap();
+    if let Some(parent) = path.parent() {
+        fs.create_dir_all(parent)?;
+    }
+    fs.writer(path)?.write_all(text.as_bytes())?;
+    Ok(())
 }
 
 impl LiveEntity {
@@ -598,6 +546,19 @@ impl LiveEntity {
             "Auto".to_string(),
             schema,
         ))
+    }
+
+    /// A root handle over a schema supplied directly, rather than read from `schema.toml`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the root cannot be read.
+    pub fn load_from_root_with(
+        fs: Arc<Mutex<dyn Xfs + Send + Sync>>,
+        root_path: PathBuf,
+        schema: Arc<Schema>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self::new(fs, root_path, EntityPath::empty(), "Auto".to_string(), schema))
     }
 
     /// Returns the logical path of this entity.
@@ -956,12 +917,7 @@ impl LiveEntity {
     }
 
     fn write_file(&self, path: &Path, text: &str) -> anyhow::Result<()> {
-        let mut fs = self.root.fs.lock().unwrap();
-        if let Some(parent) = path.parent() {
-            fs.create_dir_all(parent)?;
-        }
-        fs.writer(path)?.write_all(text.as_bytes())?;
-        Ok(())
+        write_file(&self.root, path, text)
     }
 
     /// Deletes the entity and its associated files from disk.
@@ -1117,17 +1073,19 @@ impl LiveEntity {
     /// The child's node type is inferred from the parent schema; call
     /// [`ChildBuilder::with_type`] if the schema cannot determine it.
     /// All validation and disk writes happen in [`ChildBuilder::build`].
-    pub fn create_child(&self, entry: EntityPathEntry) -> ChildBuilder {
+    pub fn create_child(&self, name: &str) -> ChildBuilder {
         ChildBuilder {
             root: self.root.clone(),
             parent_path: self.path.clone(),
             parent_node_type: self.node_type.clone(),
-            entry,
             parent_inherited_layout: self.inherited_layout,
+            name: name.to_string(),
             node_type_override: None,
             content_text: None,
-            content_layout: ChildContentLayout::Inferred,
             metadata: None,
+            metadata_location: None,
+            edge_override: None,
+            layout_override: None,
             nested_children: vec![],
         }
     }
@@ -1297,7 +1255,7 @@ mod tests {
         assert_eq!(live.metadata().unwrap(), EntityMeta::inside(live.path.clone(), meta));
 
         // 3. create_child
-        live.create_child(EntityPathEntry::Slash("child1".to_string()))
+        live.create_child("child1")
             .build()
             .unwrap();
         assert_eq!(live.children().unwrap().len(), 1);
@@ -1405,7 +1363,7 @@ mod tests {
             schema,
         );
 
-        live.create_child(EntityPathEntry::Slash("child".to_string()))
+        live.create_child("child")
             .build()
             .unwrap();
 
@@ -1428,7 +1386,7 @@ mod tests {
         );
 
         let err = live
-            .create_child(EntityPathEntry::Slash("child".to_string()))
+            .create_child("child")
             .build()
             .unwrap_err();
         assert!(err.to_string().contains("already exists"), "got: {}", err);
@@ -1449,7 +1407,7 @@ mod tests {
         );
 
         let err = root
-            .create_child(EntityPathEntry::Dot("notes".to_string()))
+            .create_child("notes").with_edge(Edge::Dot)
             .build()
             .unwrap_err();
         assert!(err.to_string().contains("Root entities may only have Slash children"), "got: {}", err);
@@ -1490,7 +1448,7 @@ mod tests {
         );
 
         let child = live
-            .create_child(EntityPathEntry::Slash("child_one".to_string()))
+            .create_child("child_one")
             .build()
             .unwrap();
 
@@ -1523,7 +1481,7 @@ mod tests {
         );
 
         let err = live
-            .create_child(EntityPathEntry::Slash("other".to_string()))
+            .create_child("other")
             .build()
             .unwrap_err();
         assert!(err.to_string().contains("Unexpected child"), "got: {}", err);
@@ -1563,7 +1521,7 @@ mod tests {
         );
 
         let child = live
-            .create_child(EntityPathEntry::Slash("child_one".to_string()))
+            .create_child("child_one")
             .with_type("Child") // matches schema — should succeed
             .build()
             .unwrap();
@@ -1592,7 +1550,7 @@ mod tests {
         );
 
         let err = live
-            .create_child(EntityPathEntry::Slash("anything".to_string()))
+            .create_child("anything")
             .build()
             .unwrap_err();
         assert!(err.to_string().contains("with_type"), "got: {}", err);
@@ -1630,7 +1588,7 @@ mod tests {
         );
 
         let child = live
-            .create_child(EntityPathEntry::Slash("item".to_string()))
+            .create_child("item")
             .with_type("Chapter")
             .build()
             .unwrap();
@@ -1688,7 +1646,7 @@ mod tests {
         );
 
         let err = live
-            .create_child(EntityPathEntry::Slash("thing".to_string()))
+            .create_child("thing")
             .with_type("Chapter")  // conflicts: schema says "Scene"
             .build()
             .unwrap_err();
@@ -1706,6 +1664,13 @@ mod tests {
             layout: None,
             ignore: vec![],
         }).unwrap();
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Chapter".to_string(),
+            children: vec![],
+            allow_additional: true,
+            layout: None,
+            ignore: vec![],
+        }).unwrap();
         let schema = Arc::new(schema);
 
         let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
@@ -1718,9 +1683,9 @@ mod tests {
         // Deliberately construct a non-Table Metadata value
         let bad_meta = Metadata { value: toml::Value::String("not a table".to_string()) };
         let err = live
-            .create_child(EntityPathEntry::Slash("item".to_string()))
+            .create_child("item")
             .with_type("Chapter")
-            .with_metadata_inside(bad_meta)
+            .with_metadata_at(MetaLocation::InsideSidecar, bad_meta)
             .build()
             .unwrap_err();
         assert!(err.to_string().contains("table"), "got: {}", err);
@@ -1772,7 +1737,7 @@ mod tests {
             "Type".to_string(), schema,
         );
 
-        live.create_child(EntityPathEntry::Slash("child".to_string()))
+        live.create_child("child")
             .with_content("Hello Inside")
             .build()
             .unwrap();
@@ -1784,6 +1749,7 @@ mod tests {
         assert_eq!(content, "Hello Inside");
     }
 
+    /// C3: a dot child is parallel because its *layout* says so, not because of its edge.
     #[test]
     fn test_with_content_dot_writes_parallel() {
         let mut raw_fs = mockfs::MockFS::new();
@@ -1797,7 +1763,8 @@ mod tests {
             "Type".to_string(), schema,
         );
 
-        live.create_child(EntityPathEntry::Dot("notes".to_string()))
+        live.create_child("notes").with_edge(Edge::Dot)
+            .with_layout(Layout::Parallel)
             .with_content("Hello Parallel")
             .build()
             .unwrap();
@@ -1822,8 +1789,8 @@ mod tests {
             "Type".to_string(), schema,
         );
 
-        live.create_child(EntityPathEntry::Dot("notes".to_string()))
-            .with_content_inside("Forced Inside")
+        live.create_child("notes").with_edge(Edge::Dot)
+            .with_layout(Layout::Inside).with_content("Forced Inside")
             .build()
             .unwrap();
 
@@ -1847,8 +1814,8 @@ mod tests {
             "Type".to_string(), schema,
         );
 
-        live.create_child(EntityPathEntry::Slash("child".to_string()))
-            .with_content_parallel("Forced Parallel")
+        live.create_child("child")
+            .with_layout(Layout::Parallel).with_content("Forced Parallel")
             .build()
             .unwrap();
 
@@ -1871,8 +1838,8 @@ mod tests {
         );
 
         let meta = Metadata { value: toml::from_str("title = \"Test\"").unwrap() };
-        live.create_child(EntityPathEntry::Slash("child".to_string()))
-            .with_metadata_inside(meta)
+        live.create_child("child")
+            .with_metadata_at(MetaLocation::InsideSidecar, meta)
             .build()
             .unwrap();
 
@@ -1896,8 +1863,8 @@ mod tests {
         );
 
         let meta = Metadata { value: toml::from_str("note = \"yes\"").unwrap() };
-        live.create_child(EntityPathEntry::Dot("notes".to_string()))
-            .with_metadata_parallel(meta)
+        live.create_child("notes").with_edge(Edge::Dot)
+            .with_metadata_at(MetaLocation::ParallelSidecar, meta)
             .build()
             .unwrap();
 
@@ -1908,8 +1875,10 @@ mod tests {
         assert!(raw.contains("note"), "got: {}", raw);
     }
 
+    /// §6: a parallel node with nothing to write leaves no trace on disk, so it is
+    /// refused. An inside node would at least be a directory, so it is not.
     #[test]
-    fn test_dot_child_with_no_content_metadata_or_children_errors() {
+    fn test_parallel_child_with_no_content_metadata_or_children_errors() {
         let mut raw_fs = mockfs::MockFS::new();
         raw_fs.create_dir_all(&PathBuf::from("foo/parent")).unwrap();
         let fs = Arc::new(Mutex::new(raw_fs));
@@ -1921,7 +1890,8 @@ mod tests {
         );
 
         let err = live
-            .create_child(EntityPathEntry::Dot("notes".to_string()))
+            .create_child("notes").with_edge(Edge::Dot)
+            .with_layout(Layout::Parallel)
             .build()
             .unwrap_err();
         assert!(err.to_string().contains("nothing to write"), "got: {}", err);
@@ -1944,7 +1914,7 @@ mod tests {
         );
 
         let err = live
-            .create_child(EntityPathEntry::Dot("notes".to_string()))
+            .create_child("notes").with_edge(Edge::Dot)
             .with_content("text")
             .build()
             .unwrap_err();
@@ -1963,6 +1933,13 @@ mod tests {
             layout: None,
             ignore: vec![],
         }).unwrap();
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Chapter".to_string(),
+            children: vec![],
+            allow_additional: true,
+            layout: None,
+            ignore: vec![],
+        }).unwrap();
         let schema = Arc::new(schema);
 
         let fs = Arc::new(Mutex::new(mockfs::MockFS::new()));
@@ -1975,9 +1952,9 @@ mod tests {
         let meta = Metadata {
             value: toml::from_str("title = \"My Chapter\"").unwrap(),
         };
-        live.create_child(EntityPathEntry::Slash("item".to_string()))
+        live.create_child("item")
             .with_type("Chapter")
-            .with_metadata_inside(meta)
+            .with_metadata_at(MetaLocation::InsideSidecar, meta)
             .build()
             .unwrap();
 
@@ -2001,11 +1978,8 @@ mod tests {
 
         let meta = Metadata { value: toml::from_str("key = \"val\"").unwrap() };
         let err = live
-            .create_child(EntityPathEntry::Slash("child".to_string()))
-            .with_metadata(EntityMeta::unplaced(
-                MetaOrigin::Header { header_type: crate::entity::HeaderType::Yaml, separator: None },
-                meta,
-            ))
+            .create_child("child")
+            .with_metadata_at(MetaLocation::InHeader, meta)
             .build()
             .unwrap_err();
         assert!(err.to_string().contains("InHeader"), "got: {}", err);
@@ -2021,8 +1995,8 @@ mod tests {
             "Type".to_string(), schema,
         );
 
-        live.create_child(EntityPathEntry::Slash("chapter".to_string()))
-            .with_child(EntityPathEntry::Slash("scene".to_string()), |b| {
+        live.create_child("chapter")
+            .with_child("scene", |b| {
                 b.with_content("Scene content")
             })
             .build()
@@ -2088,8 +2062,8 @@ mod tests {
         );
 
         let chapter = live
-            .create_child(EntityPathEntry::Slash("ch_one".to_string()))
-            .with_child(EntityPathEntry::Slash("sc_one".to_string()), |b| b)
+            .create_child("ch_one")
+            .with_child("sc_one", |b| b)
             .build()
             .unwrap();
 
@@ -2126,7 +2100,7 @@ mod tests {
         );
 
         let err = live
-            .create_child(EntityPathEntry::Slash("thing".to_string()))
+            .create_child("thing")
             .build() // no with_type() call
             .unwrap_err();
         assert!(err.to_string().contains("Auto"), "got: {}", err);
@@ -2695,5 +2669,306 @@ mod live_write_tests {
 
         assert!(err.contains("foo/ch1.meta.toml"), "the message names the file: {}", err);
         assert!(!err.contains("set_metadata_at"), "no Rust API in the message: {}", err);
+    }
+}
+
+#[cfg(test)]
+mod create_child_tests {
+    use super::*;
+    use crate::placement::Edge;
+    use inscenerator_xfs::mockfs;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    /// `Chapter` is parallel; `Section` declares no layout, so it takes the layout of the
+    /// chapter instance it is created under (§2.1). `Figure` declares its own. The three
+    /// `Chapter` rules cover both edges, which is what edge resolution is read against.
+    const SCHEMA: &str = r#"
+[Root]
+allow_additional = false
+[[Root.children]]
+name_regex = "^ch"
+node_type = "Chapter"
+
+[Chapter]
+allow_additional = false
+layout = "parallel"
+[[Chapter.children]]
+name_regex = '^\d{3}-'
+node_type = "Section"
+edge = "slash"
+[[Chapter.children]]
+name_regex = "^review$"
+node_type = "Section"
+edge = "dot"
+[[Chapter.children]]
+name_regex = "^fig-"
+node_type = "Figure"
+edge = "slash"
+
+[Section]
+allow_additional = false
+children = []
+
+[Figure]
+allow_additional = false
+layout = "inside"
+children = []
+"#;
+
+    /// A case: the child to create, and the whole tree that must result.
+    type BuildCase<'a> = (&'a str, &'a [&'a str], &'a str);
+
+    fn fs_with(files: &[(&str, &str)]) -> Arc<Mutex<mockfs::MockFS>> {
+        let mut fs = mockfs::MockFS::new();
+        fs.create_dir_all(&PathBuf::from("foo")).unwrap();
+        for (path, content) in files {
+            let p = PathBuf::from(path);
+            fs.create_dir_all(p.parent().unwrap()).unwrap();
+            fs.add_r(&p, content.as_bytes().to_vec()).unwrap();
+        }
+        Arc::new(Mutex::new(fs))
+    }
+
+    /// A handle on the chapter `ch1`, reached through the root so it inherits normally.
+    fn ch1(files: &[(&str, &str)]) -> LiveEntity {
+        LiveEntity::new(
+            fs_with(files),
+            PathBuf::from("foo"),
+            EntityPath::empty(),
+            "Root".to_string(),
+            Arc::new(Schema::load_from_str(SCHEMA).unwrap()),
+        )
+        .child("ch1")
+        .unwrap()
+    }
+
+    /// Everything under the base path, directories included and marked with a trailing
+    /// `/`. These tests assert the *whole* tree, because what was not created — a
+    /// directory for a node that is a file, a `content.md` beside a spine file — is as
+    /// much of the claim as what was.
+    fn tree(live: &LiveEntity) -> Vec<String> {
+        fn walk(fs: &dyn Xfs, dir: &Path, out: &mut Vec<String>) {
+            let mut entries: Vec<PathBuf> =
+                fs.read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+            entries.sort();
+            for p in entries {
+                if fs.is_dir(&p) {
+                    out.push(format!("{}/", p.display()));
+                    walk(fs, &p, out);
+                } else {
+                    out.push(p.display().to_string());
+                }
+            }
+        }
+        let fs = live.root.fs.lock().unwrap();
+        let mut out = Vec::new();
+        walk(&*fs, &live.root.base_path, &mut out);
+        out
+    }
+
+    fn meta(src: &str) -> Metadata {
+        Metadata { value: toml::from_str(src).unwrap() }
+    }
+
+    /// §5: the shape the whole design exists to make expressible — a readable spine file
+    /// with a folder of its sections beside it — built through the API by nothing but
+    /// names. Neither the edge nor the layout is stated at any call site here; both come
+    /// out of the schema.
+    #[test]
+    fn section_five_shape_is_buildable_through_the_api() {
+        const BOOK: &str = r#"
+[Root]
+allow_additional = false
+[[Root.children]]
+name_regex = "^chapters$"
+node_type = "Chapters"
+
+[Chapters]
+allow_additional = false
+layout = "inside"
+[[Chapters.children]]
+name_regex = '^\d{3}-'
+node_type = "Chapter"
+
+[Chapter]
+allow_additional = false
+layout = "parallel"
+[[Chapter.children]]
+name_regex = '^\d{3}-'
+node_type = "Section"
+[[Chapter.children]]
+name_regex = "^review$"
+node_type = "Section"
+
+[Section]
+allow_additional = false
+children = []
+"#;
+        let fs = fs_with(&[("book/meta.toml", "type = \"Root\"")]);
+        let root = LiveEntity::load_from_root_with(
+            fs,
+            PathBuf::from("book"),
+            Arc::new(Schema::load_from_str(BOOK).unwrap()),
+        )
+        .unwrap();
+
+        let chapters = root.create_child("chapters").build().unwrap();
+        let ch = chapters
+            .create_child("000-the-invisible-kitchen")
+            .with_content("Chapter body")
+            .build()
+            .unwrap();
+        ch.create_child("010-what-fermentation-is").with_content("Section body").build().unwrap();
+        ch.create_child("review").with_content("Review body").build().unwrap();
+
+        assert_eq!(
+            tree(&root),
+            vec![
+                "book/chapters/",
+                "book/chapters/000-the-invisible-kitchen/",
+                "book/chapters/000-the-invisible-kitchen/010-what-fermentation-is.md",
+                "book/chapters/000-the-invisible-kitchen/review.md",
+                "book/chapters/000-the-invisible-kitchen.md",
+                "book/meta.toml",
+            ]
+        );
+    }
+
+    /// C4: the edge a new child attaches on is declared by the parent's rule, not implied
+    /// by anything the caller says.
+    #[test]
+    fn a_new_child_goes_on_the_edge_its_rule_declares() {
+        let cases: &[BuildCase] = &[
+            ("010-intro", &["foo/ch1/", "foo/ch1/010-intro.md", "foo/ch1.md"], "edge = slash"),
+            ("review", &["foo/ch1.md", "foo/ch1.review.md"], "edge = dot"),
+        ];
+        for (name, expected, why) in cases {
+            let ch1 = ch1(&[("foo/ch1.md", "chapter")]);
+            ch1.create_child(name).with_content("body").build().unwrap();
+            assert_eq!(tree(&ch1), *expected, "{}", why);
+        }
+    }
+
+    /// §4.2: a rule declares an edge, but children already sitting on the other one are
+    /// evidence of a decision this tree has made. A new sibling joins them rather than
+    /// splitting the rule in two.
+    #[test]
+    fn a_new_child_joins_the_edge_its_siblings_are_on() {
+        let ch1 = ch1(&[("foo/ch1.md", "chapter"), ("foo/ch1.010-intro.md", "intro")]);
+        ch1.create_child("020-body").with_content("body").build().unwrap();
+
+        assert_eq!(
+            tree(&ch1),
+            vec!["foo/ch1.010-intro.md", "foo/ch1.020-body.md", "foo/ch1.md"]
+        );
+    }
+
+    /// §4.5: but a rule already split across both edges is not evidence of anything, so a
+    /// new child conforms to the declaration rather than spreading the split further.
+    #[test]
+    fn a_new_child_under_a_split_rule_takes_the_declared_edge() {
+        let ch1 = ch1(&[
+            ("foo/ch1.md", "chapter"),
+            ("foo/ch1.010-intro.md", "intro"),
+            ("foo/ch1/020-body.md", "body"),
+        ]);
+        ch1.create_child("030-end").with_content("end").build().unwrap();
+
+        assert_eq!(
+            tree(&ch1),
+            vec![
+                "foo/ch1/",
+                "foo/ch1/020-body.md",
+                "foo/ch1/030-end.md",
+                "foo/ch1.010-intro.md",
+                "foo/ch1.md",
+            ]
+        );
+    }
+
+    /// §2.1 / §8.1: layout is the child type's when it declares one, and the layout of the
+    /// parent instance otherwise — which is what makes a section beside a chapter file a
+    /// file too, without either type having to mention the other.
+    #[test]
+    fn a_childs_layout_is_its_types_or_the_parent_instances() {
+        let cases: &[BuildCase] = &[
+            (
+                "010-intro",
+                &["foo/ch1/", "foo/ch1/010-intro.md", "foo/ch1.md"],
+                "Section declares no layout, so it inherits the chapter's",
+            ),
+            (
+                "fig-1",
+                &["foo/ch1/", "foo/ch1/fig-1/", "foo/ch1/fig-1/content.md", "foo/ch1.md"],
+                "Figure declares inside, which beats what it would have inherited",
+            ),
+        ];
+        for (name, expected, why) in cases {
+            let ch1 = ch1(&[("foo/ch1.md", "chapter")]);
+            ch1.create_child(name).with_content("body").build().unwrap();
+            assert_eq!(tree(&ch1), *expected, "{}", why);
+        }
+    }
+
+    /// §8.1: the two are separately overridable, which is the point of keeping them
+    /// orthogonal — and the escape hatch, not the ordinary path. Each override is applied
+    /// to its own tree, since one child is evidence the next one would follow (§4.2).
+    #[test]
+    fn with_edge_and_with_layout_override_what_was_resolved() {
+        let dotted = ch1(&[("foo/ch1.md", "chapter")]);
+        dotted.create_child("010-intro").with_content("body").with_edge(Edge::Dot).build().unwrap();
+        assert_eq!(tree(&dotted), vec!["foo/ch1.010-intro.md", "foo/ch1.md"]);
+
+        let ch1b = ch1(&[("foo/ch1.md", "chapter")]);
+        ch1b.create_child("010-intro")
+            .with_content("body")
+            .with_layout(Layout::Inside)
+            .build()
+            .unwrap();
+        assert_eq!(
+            tree(&ch1b),
+            vec!["foo/ch1/", "foo/ch1/010-intro/", "foo/ch1/010-intro/content.md", "foo/ch1.md"]
+        );
+    }
+
+    /// §4.1: a new child's metadata goes where its layout says, and nowhere else unless
+    /// the caller places it. C3: the edge it hangs off has no say in this.
+    #[test]
+    fn metadata_lands_in_the_layouts_sidecar_unless_placed_explicitly() {
+        let ch1 = ch1(&[("foo/ch1.md", "chapter")]);
+        ch1.create_child("010-intro").with_metadata(meta("owner = \"a\"")).build().unwrap();
+        ch1.create_child("review")
+            .with_content("body")
+            .with_metadata_at(MetaLocation::InHeader, meta("owner = \"b\""))
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            tree(&ch1),
+            vec![
+                "foo/ch1/",
+                "foo/ch1/010-intro.meta.toml",
+                "foo/ch1.md",
+                "foo/ch1.review.md",
+            ],
+            "the parallel sidecar for one, the content file itself for the other"
+        );
+        let owner = |name: &str| ch1.child(name).unwrap().metadata().unwrap().get_str("owner").unwrap();
+        assert_eq!(owner("010-intro").as_deref(), Some("a"));
+        assert_eq!(owner("review").as_deref(), Some("b"));
+    }
+
+    /// The handle `build` hands back is a handle on the child it just wrote: it reads
+    /// that child's content, and children created through it inherit its layout rather
+    /// than the layout its edge would have implied.
+    #[test]
+    fn the_handle_build_returns_reads_the_child_it_just_wrote() {
+        let ch1 = ch1(&[("foo/ch1.md", "chapter")]);
+        let intro = ch1.create_child("010-intro").with_content("intro body").build().unwrap();
+
+        assert_eq!(intro.content().unwrap(), "intro body");
+        assert_eq!(intro.intended_layout().unwrap(), Layout::Parallel);
+        assert_eq!(intro.actual_type().unwrap(), "Section");
     }
 }
