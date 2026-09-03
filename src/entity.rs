@@ -218,7 +218,6 @@ impl EntityPathEntry {
 }
 
 pub(crate) mod utils {
-    use std::collections::BTreeSet;
     use yaml_rust::Yaml;
 
     use super::*;
@@ -305,80 +304,29 @@ pub(crate) mod utils {
         Ok(to_write)
     }
 
+    /// Dot children of `entity_path`, as logical paths.
+    ///
+    /// A thin adapter over [`crate::discovery`], which owns the scan. Prefer
+    /// `discovery::resolve_children`: this pass alone cannot see that a name also exists
+    /// on the other edge, which is what defect C2 was made of.
     pub fn find_dot_children(
         fs: &dyn Xfs,
         base_path: &Path,
         entity_path: &EntityPath,
     ) -> anyhow::Result<Vec<EntityPath>> {
-        let p = entity_path.to_pathbuf(base_path);
-        let Some(p_str) = p.to_str() else {
-            bail!("path {p:?} not convertable to string.")
-        };
-        let Some(entity_dir) = p.parent() else {
-            bail!("Entity path {:?} has no parent", p);
-        };
-        let mut child_names: BTreeSet<String> = BTreeSet::new();
-
-        let p_dot_str = format!("{}.", p_str);
-        for de in fs.read_dir(entity_dir)? {
-            let de = de?;
-            let entry_path = de.path();
-            let Some(entry_path_str) = entry_path.to_str() else {
-                bail!("child path {entry_path:?} not converable to srting")
-            };
-
-            // Now we only want something like entity.suffix (where suffix might contain more '.' characters.)
-            // Throw away the start, just keeping the suffix.
-            let Some(suffix) = entry_path_str.strip_prefix(&p_dot_str) else {
-                continue;
-            };
-
-            // We want to skip a couple of special cases
-            if suffix == "md" || suffix == "meta.toml" {
-                continue;
-            }
-
-            // Now if the suffix is of the form 'name.rest' we just want name, but if there is no '.'
-            // then we just want 'name'.
-            let name = match suffix.split_once('.') {
-                Some((name, _)) => name,
-                None => suffix,
-            };
-
-            child_names.insert(name.to_string());
-        }
-
-        Ok(child_names
+        Ok(crate::discovery::dot_child_names(fs, base_path, entity_path)?
             .into_iter()
             .map(|name| entity_path.extend(EntityPathEntry::Dot(name)))
             .collect())
     }
 
+    /// Slash children of `entity_path`, as logical paths. See [`find_dot_children`].
     pub fn find_slash_children(
         fs: &dyn Xfs,
         base_path: &Path,
         entity_path: &EntityPath,
     ) -> anyhow::Result<Vec<EntityPath>> {
-        let entity_dir = entity_path.to_pathbuf(base_path);
-        if !fs.is_dir(&entity_dir) {
-            return Ok(vec![]);
-        }
-        let mut child_names: BTreeSet<String> = BTreeSet::new();
-
-        for de in fs.read_dir(&entity_dir)? {
-            let de = de?;
-            let entry_path = de.path();
-            if let Some(full_filename) = entry_path.file_name() {
-                if full_filename == "content.md" || full_filename == "meta.toml" || full_filename == "schema.toml" {
-                    continue;
-                }
-            }
-            let Some(name) = entry_path.file_prefix().and_then(|s| s.to_str()) else {
-                bail!("Entry path {:?} has no filename", entry_path);
-            };
-            child_names.insert(name.to_string());
-        }
-        Ok(child_names
+        Ok(crate::discovery::slash_child_names(fs, base_path, entity_path)?
             .into_iter()
             .map(|name| entity_path.extend(EntityPathEntry::Slash(name)))
             .collect())

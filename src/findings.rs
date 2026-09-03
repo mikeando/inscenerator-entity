@@ -40,8 +40,7 @@ pub enum FindingKindId {
     EdgeNonconformance,
     SplitChildEdge,
     StrayContent,
-    StrayChild,
-    AmbiguousChild,
+    DuplicateChildName,
     MissingRequiredChild,
     MultipleChildrenNotAllowed,
     UnexpectedChild,
@@ -50,7 +49,7 @@ pub enum FindingKindId {
 
 impl FindingKindId {
     /// Every kind. A policy that speaks for "everything" enumerates this.
-    pub const ALL: [FindingKindId; 14] = [
+    pub const ALL: [FindingKindId; 13] = [
         FindingKindId::MalformedMetadata,
         FindingKindId::MetadataKeyConflict,
         FindingKindId::SplitMetadata,
@@ -59,8 +58,7 @@ impl FindingKindId {
         FindingKindId::EdgeNonconformance,
         FindingKindId::SplitChildEdge,
         FindingKindId::StrayContent,
-        FindingKindId::StrayChild,
-        FindingKindId::AmbiguousChild,
+        FindingKindId::DuplicateChildName,
         FindingKindId::MissingRequiredChild,
         FindingKindId::MultipleChildrenNotAllowed,
         FindingKindId::UnexpectedChild,
@@ -115,14 +113,12 @@ pub enum FindingKind {
         path: PathBuf,
         location: ContentLocation,
     },
-    /// The losing half of a name found on both edges. §4.4.
-    StrayChild {
-        name: String,
-        edge: Edge,
-        path: PathBuf,
-    },
-    /// A name on both edges that intent could not disambiguate. §3.1, §4.4.
-    AmbiguousChild {
+    /// Two children share a name across the edges. §4.4.
+    ///
+    /// Both load — they are distinct addresses that merely share a name, and `(edge, name)`
+    /// is what identifies a child. Only name-based lookup is ambiguous, and that fails at
+    /// the call rather than here.
+    DuplicateChildName {
         name: String,
         dot_path: PathBuf,
         slash_path: PathBuf,
@@ -158,8 +154,7 @@ impl FindingKind {
             FindingKind::EdgeNonconformance { .. } => FindingKindId::EdgeNonconformance,
             FindingKind::SplitChildEdge { .. } => FindingKindId::SplitChildEdge,
             FindingKind::StrayContent { .. } => FindingKindId::StrayContent,
-            FindingKind::StrayChild { .. } => FindingKindId::StrayChild,
-            FindingKind::AmbiguousChild { .. } => FindingKindId::AmbiguousChild,
+            FindingKind::DuplicateChildName { .. } => FindingKindId::DuplicateChildName,
             FindingKind::MissingRequiredChild { .. } => FindingKindId::MissingRequiredChild,
             FindingKind::MultipleChildrenNotAllowed { .. } => {
                 FindingKindId::MultipleChildrenNotAllowed
@@ -211,14 +206,9 @@ impl fmt::Display for FindingKind {
             FindingKind::StrayContent { path, location } => {
                 write!(f, "Stray {:?} content file at {:?}", location, path)
             }
-            FindingKind::StrayChild { name, edge, path } => write!(
+            FindingKind::DuplicateChildName { name, dot_path, slash_path } => write!(
                 f,
-                "Stray child '{}' on the {:?} edge at {:?}",
-                name, edge, path
-            ),
-            FindingKind::AmbiguousChild { name, dot_path, slash_path } => write!(
-                f,
-                "Child '{}' exists on both edges ({:?} and {:?}) and no rule declares which is intended",
+                "Two children are named '{}' ({:?} and {:?}); look them up by edge",
                 name, dot_path, slash_path
             ),
             FindingKind::MissingRequiredChild { rule_index, name_regex } => write!(
@@ -272,7 +262,6 @@ impl FindingPolicy {
         match id {
             // No resolution the library can pick, or a flat schema violation.
             FindingKindId::MetadataKeyConflict
-            | FindingKindId::AmbiguousChild
             | FindingKindId::UnexpectedChild
             | FindingKindId::TypeMismatch => Severity::Error,
             // Everything else is drift: normal in a tree humans edit by hand.
@@ -363,15 +352,14 @@ impl FindingSink {
 mod tests {
     use super::*;
     use crate::entity::EntityPath;
-    use crate::placement::{Edge, MetaLocation};
+    use crate::placement::{ContentLocation, MetaLocation};
 
-    fn stray_child() -> Finding {
+    fn stray_content() -> Finding {
         Finding {
             path: EntityPath::empty().extend_slash("ch1"),
-            kind: FindingKind::StrayChild {
-                name: "notes".into(),
-                edge: Edge::Dot,
-                path: "base/ch1.notes".into(),
+            kind: FindingKind::StrayContent {
+                path: "base/ch1/content.md".into(),
+                location: ContentLocation::Inside,
             },
         }
     }
@@ -394,12 +382,11 @@ mod tests {
             (EdgeNonconformance, Warn),
             (SplitChildEdge, Warn),
             (StrayContent, Warn),
-            (StrayChild, Warn),
+            (DuplicateChildName, Warn),
             (MissingRequiredChild, Warn),
             (MultipleChildrenNotAllowed, Warn),
             // No defined resolution without a human, or a flat schema violation.
             (MetadataKeyConflict, Error),
-            (AmbiguousChild, Error),
             (UnexpectedChild, Error),
             (TypeMismatch, Error),
         ];
@@ -418,16 +405,16 @@ mod tests {
     /// D6: severity is per kind, and an override replaces whatever came before it.
     #[test]
     fn severity_is_configurable_per_kind() {
-        let policy = FindingPolicy::default().with(FindingKindId::StrayChild, Severity::Error);
-        assert_eq!(policy.severity(&stray_child().kind), Severity::Error);
+        let policy = FindingPolicy::default().with(FindingKindId::StrayContent, Severity::Error);
+        assert_eq!(policy.severity(&stray_content().kind), Severity::Error);
         // A neighbouring kind is untouched.
         assert_eq!(
-            policy.severity_of(FindingKindId::StrayContent),
+            policy.severity_of(FindingKindId::DuplicateChildName),
             Severity::Warn
         );
 
-        let policy = policy.with(FindingKindId::StrayChild, Severity::Ignore);
-        assert_eq!(policy.severity(&stray_child().kind), Severity::Ignore);
+        let policy = policy.with(FindingKindId::StrayContent, Severity::Ignore);
+        assert_eq!(policy.severity(&stray_content().kind), Severity::Ignore);
     }
 
     /// The two presets are all-or-nothing across every kind.
@@ -444,18 +431,18 @@ mod tests {
     #[test]
     fn report_drops_ignored_records_warnings_and_fails_on_errors() {
         let mut sink = FindingSink::new(FindingPolicy::silent());
-        assert!(sink.report(stray_child()).is_ok());
+        assert!(sink.report(stray_content()).is_ok());
         assert!(sink.findings().is_empty());
 
         let mut sink = FindingSink::new(FindingPolicy::default());
-        assert!(sink.report(stray_child()).is_ok());
-        assert_eq!(sink.findings(), &[stray_child()]);
+        assert!(sink.report(stray_content()).is_ok());
+        assert_eq!(sink.findings(), &[stray_content()]);
 
         let mut sink = FindingSink::new(FindingPolicy::strict());
-        let err = sink.report(stray_child()).unwrap_err().to_string();
-        assert!(err.contains("notes"), "must name the finding: {}", err);
+        let err = sink.report(stray_content()).unwrap_err().to_string();
+        assert!(err.contains("content.md"), "must name the finding: {}", err);
         assert!(err.contains("ch1"), "must name the entity: {}", err);
-        assert_eq!(sink.findings(), &[stray_child()]);
+        assert_eq!(sink.findings(), &[stray_content()]);
     }
 
     /// `issues()` exists to report rather than to enforce, so it needs a channel that
@@ -463,7 +450,7 @@ mod tests {
     #[test]
     fn observe_records_regardless_of_policy() {
         let mut sink = FindingSink::new(FindingPolicy::silent());
-        sink.observe(stray_child());
+        sink.observe(stray_content());
         sink.observe(Finding {
             path: EntityPath::empty(),
             kind: FindingKind::MetadataKeyConflict {
