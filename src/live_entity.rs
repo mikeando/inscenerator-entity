@@ -664,28 +664,6 @@ impl LiveEntity {
         self.path.to_pathbuf(&self.root.base_path)
     }
 
-    /// Parallel content path: `name.md` (lives alongside the entity, not inside it).
-    fn dot_content_path(&self) -> PathBuf {
-        placement::content_path(&self.root.base_path, &self.path, ContentLocation::Parallel)
-    }
-
-    /// Inside content path: `dir/content.md`.
-    fn slash_content_path(&self) -> PathBuf {
-        placement::content_path(&self.root.base_path, &self.path, ContentLocation::Inside)
-    }
-
-    /// Parallel metadata path: `name.meta.toml` — the suffix is *appended* to the stem.
-    /// Substituting it resolved a dot child onto its parent's sidecar (C1).
-    fn dot_metadata_path(&self) -> PathBuf {
-        placement::sidecar_path(&self.root.base_path, &self.path, MetaLocation::ParallelSidecar)
-            .expect("a sidecar location always has a path")
-    }
-
-    /// Inside metadata path: `dir/meta.toml`.
-    fn slash_metadata_path(&self) -> PathBuf {
-        placement::sidecar_path(&self.root.base_path, &self.path, MetaLocation::InsideSidecar)
-            .expect("a sidecar location always has a path")
-    }
 
     /// Reads the content of the entity from disk.
     ///
@@ -939,13 +917,18 @@ impl LiveEntity {
             }
         }
 
-        // 1. Delete content files
-        let _ = fs.remove_file(&self.dot_content_path());
-        let _ = fs.remove_file(&self.slash_content_path());
-
-        // 2. Delete metadata files
-        let _ = fs.remove_file(&self.dot_metadata_path());
-        let _ = fs.remove_file(&self.slash_metadata_path());
+        // 1. Delete both content files and both sidecars. Which of them a node actually
+        //    has is its own business (a mixed node has one of each); delete removes the
+        //    node, so it removes whatever is there.
+        let base = &self.root.base_path;
+        for loc in [ContentLocation::Parallel, ContentLocation::Inside] {
+            let _ = fs.remove_file(&placement::content_path(base, &self.path, loc));
+        }
+        for loc in [MetaLocation::ParallelSidecar, MetaLocation::InsideSidecar] {
+            if let Some(p) = placement::sidecar_path(base, &self.path, loc) {
+                let _ = fs.remove_file(&p);
+            }
+        }
 
         // 3. Delete the directory if it exists
         let on_disk = self.on_disk_path();
@@ -985,6 +968,16 @@ impl LiveEntity {
 
     /// Moves/renames the entity on disk to a new logical path.
     ///
+    /// This **relocates and does not normalise** (§9.3): every file keeps the layout it
+    /// arrived with, at the new stem. If the node's new position intends a different
+    /// layout, that disagreement is a finding on the moved node — [`Self::issues`] will
+    /// report it — not something this call repairs (D5). Normalisation is a separate
+    /// operation.
+    ///
+    /// A moved handle's [`Self::inherited_layout`] is whatever it was before the move,
+    /// which is stale if the node changed parents. Re-fetch through the new parent's
+    /// [`Self::child`] to get one that inherits correctly.
+    ///
     /// # Errors
     ///
     /// Returns an error if disk access fails or if nothing is found to move.
@@ -996,23 +989,28 @@ impl LiveEntity {
 
         let mut moved_anything = false;
 
-        let dot_content = self.dot_content_path();
-        if fs.is_file(&dot_content) {
-            let new_dot_content = new_path.to_pathbuf(&self.root.base_path).with_added_extension("md");
-            if let Some(parent) = new_dot_content.parent() {
-                fs.create_dir_all(parent)?;
-            }
-            fs.rename(&dot_content, &new_dot_content)?;
-            moved_anything = true;
+        // The node's own parallel files. The inside pair lives in the stem directory,
+        // which the directory rename below carries; a mixed node (C7) has one of each,
+        // so both passes have to run.
+        let base = &self.root.base_path;
+        let mut own_files = vec![(
+            placement::content_path(base, &self.path, ContentLocation::Parallel),
+            placement::content_path(base, &new_path, ContentLocation::Parallel),
+        )];
+        if let (Some(from), Some(to)) = (
+            placement::sidecar_path(base, &self.path, MetaLocation::ParallelSidecar),
+            placement::sidecar_path(base, &new_path, MetaLocation::ParallelSidecar),
+        ) {
+            own_files.push((from, to));
         }
-
-        let dot_metadata = self.dot_metadata_path();
-        if fs.is_file(&dot_metadata) {
-            let new_dot_metadata = new_path.to_pathbuf(&self.root.base_path).with_extension("meta.toml");
-            if let Some(parent) = new_dot_metadata.parent() {
+        for (from, to) in own_files {
+            if !fs.is_file(&from) {
+                continue;
+            }
+            if let Some(parent) = to.parent() {
                 fs.create_dir_all(parent)?;
             }
-            fs.rename(&dot_metadata, &new_dot_metadata)?;
+            fs.rename(&from, &to)?;
             moved_anything = true;
         }
 
@@ -2673,7 +2671,7 @@ mod live_write_tests {
 }
 
 #[cfg(test)]
-mod create_child_tests {
+pub(super) mod create_child_tests {
     use super::*;
     use crate::placement::Edge;
     use inscenerator_xfs::mockfs;
@@ -2683,7 +2681,7 @@ mod create_child_tests {
     /// `Chapter` is parallel; `Section` declares no layout, so it takes the layout of the
     /// chapter instance it is created under (§2.1). `Figure` declares its own. The three
     /// `Chapter` rules cover both edges, which is what edge resolution is read against.
-    const SCHEMA: &str = r#"
+    pub(super) const SCHEMA: &str = r#"
 [Root]
 allow_additional = false
 [[Root.children]]
@@ -2719,7 +2717,7 @@ children = []
     /// A case: the child to create, and the whole tree that must result.
     type BuildCase<'a> = (&'a str, &'a [&'a str], &'a str);
 
-    fn fs_with(files: &[(&str, &str)]) -> Arc<Mutex<mockfs::MockFS>> {
+    pub(super) fn fs_with(files: &[(&str, &str)]) -> Arc<Mutex<mockfs::MockFS>> {
         let mut fs = mockfs::MockFS::new();
         fs.create_dir_all(&PathBuf::from("foo")).unwrap();
         for (path, content) in files {
@@ -2747,7 +2745,7 @@ children = []
     /// `/`. These tests assert the *whole* tree, because what was not created — a
     /// directory for a node that is a file, a `content.md` beside a spine file — is as
     /// much of the claim as what was.
-    fn tree(live: &LiveEntity) -> Vec<String> {
+    pub(super) fn tree(live: &LiveEntity) -> Vec<String> {
         fn walk(fs: &dyn Xfs, dir: &Path, out: &mut Vec<String>) {
             let mut entries: Vec<PathBuf> =
                 fs.read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
@@ -2970,5 +2968,134 @@ children = []
         assert_eq!(intro.content().unwrap(), "intro body");
         assert_eq!(intro.intended_layout().unwrap(), Layout::Parallel);
         assert_eq!(intro.actual_type().unwrap(), "Section");
+    }
+}
+
+/// `move_to` relocates; it never normalises. Section references are to
+/// `docs/storage-layout-v2.md`.
+#[cfg(test)]
+mod move_tests {
+    use super::create_child_tests::{fs_with, tree, SCHEMA};
+    use super::*;
+    use crate::findings::FindingKind;
+    use std::sync::Arc;
+
+    /// A handle on the root of a tree built from `files`.
+    fn root(files: &[(&str, &str)]) -> LiveEntity {
+        LiveEntity::new(
+            fs_with(files),
+            PathBuf::from("foo"),
+            EntityPath::empty(),
+            "Root".to_string(),
+            Arc::new(Schema::load_from_str(SCHEMA).unwrap()),
+        )
+    }
+
+    /// C1's last site: the sidecar suffix is appended to the new stem, so a moved
+    /// dot-child cannot land on its parent's sidecar.
+    #[test]
+    fn move_relocates_a_dot_childs_appended_sidecar() {
+        let root = root(&[
+            ("foo/ch1.md", "chapter"),
+            ("foo/ch1.meta.toml", "owner = \"chapter\""),
+            ("foo/ch1.review.md", "review"),
+            ("foo/ch1.review.meta.toml", "owner = \"review\""),
+        ]);
+        let ch1 = root.child("ch1").unwrap();
+        let mut review = ch1.child("review").unwrap();
+
+        review.move_to(ch1.path.extend_dot("notes")).unwrap();
+
+        assert_eq!(
+            tree(&root),
+            vec![
+                "foo/ch1.md",
+                "foo/ch1.meta.toml",
+                "foo/ch1.notes.md",
+                "foo/ch1.notes.meta.toml",
+            ]
+        );
+        // The parent's own metadata is untouched, which is the whole of C1.
+        assert_eq!(ch1.metadata().unwrap().get_str("owner").unwrap().as_deref(), Some("chapter"));
+    }
+
+    /// §9.3: a dot-descendant's path derives from this node's, so relocating this node
+    /// drags it along.
+    #[test]
+    fn move_drags_dot_descendants() {
+        let root = root(&[
+            ("foo/ch1.md", "chapter"),
+            ("foo/ch1.review.md", "review"),
+            ("foo/ch1.review.draft.md", "draft"),
+        ]);
+        let ch1 = root.child("ch1").unwrap();
+        let mut review = ch1.child("review").unwrap();
+
+        review.move_to(ch1.path.extend_dot("notes")).unwrap();
+
+        assert_eq!(
+            tree(&root),
+            vec!["foo/ch1.md", "foo/ch1.notes.draft.md", "foo/ch1.notes.md"]
+        );
+    }
+
+    /// D5: layout survives a move. `fig-1` matches a rule whose type declares `inside`,
+    /// but the files that arrived are parallel, so they stay parallel and the resulting
+    /// disagreement is reported rather than repaired.
+    #[test]
+    fn move_preserves_layout_and_reports_the_result() {
+        let root = root(&[("foo/ch1.md", "chapter"), ("foo/ch1/010-intro.md", "intro")]);
+        let ch1 = root.child("ch1").unwrap();
+        let mut intro = ch1.child("010-intro").unwrap();
+
+        intro.move_to(ch1.path.extend_slash("fig-1")).unwrap();
+
+        assert_eq!(tree(&root), vec!["foo/ch1/", "foo/ch1/fig-1.md", "foo/ch1.md"]);
+
+        let fig = ch1.child("fig-1").unwrap();
+        assert_eq!(fig.actual_type().unwrap(), "Figure");
+        assert_eq!(fig.intended_layout().unwrap(), Layout::Inside);
+        assert!(fig.issues().unwrap().iter().any(|f| matches!(
+            f.kind,
+            FindingKind::ContentLocationNonconformance {
+                actual: ContentLocation::Parallel,
+                intended: ContentLocation::Inside,
+            }
+        )));
+    }
+
+    /// C7: a mixed node keeps both of its files. The directory rename carries the inside
+    /// sidecar; the parallel content has to be moved on its own.
+    #[test]
+    fn move_carries_both_halves_of_a_mixed_node() {
+        let root = root(&[
+            ("foo/ch1.md", "chapter"),
+            ("foo/ch1/010-intro.md", "intro"),
+            ("foo/ch1/010-intro/meta.toml", "owner = \"intro\""),
+        ]);
+        let ch1 = root.child("ch1").unwrap();
+        let mut intro = ch1.child("010-intro").unwrap();
+
+        intro.move_to(ch1.path.extend_slash("020-body")).unwrap();
+
+        assert_eq!(
+            tree(&root),
+            vec![
+                "foo/ch1/",
+                "foo/ch1/020-body/",
+                "foo/ch1/020-body/meta.toml",
+                "foo/ch1/020-body.md",
+                "foo/ch1.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn moving_a_node_that_is_not_there_is_an_error() {
+        let root = root(&[("foo/ch1.md", "chapter")]);
+        let mut ghost = root.child("ch1").unwrap();
+        ghost.path = EntityPath::empty().extend_slash("ch9");
+        let err = ghost.move_to(EntityPath::empty().extend_slash("ch8")).unwrap_err();
+        assert!(err.to_string().contains("Nothing found to move"), "got: {}", err);
     }
 }
