@@ -1,7 +1,13 @@
 # Storage Layout v2 — Target Spec
 
-**Status: target design. Not implemented. Supersedes [`storage-layout.md`](storage-layout.md),
-which remains as the as-built description of the current code.**
+**Status: §1–§8 and §9.1 are implemented as of 0.2.0. §9.2–§9.4 (normalisation, move planning)
+remain outstanding, as do rulings for D7 and D8. D1–D6 are ruled as recorded below.
+[`storage-layout.md`](storage-layout.md) is the as-built description of the implemented code;
+this document remains the design argument behind it.**
+
+The defect catalogue C1–C11 is closed: each defect has a test that fails against the old
+behaviour and passes now. §8.2, the Lua `add_child{}` table-call surface, lives in
+`inscenerator-booker-agents4` and was never in scope here.
 
 **Backwards compatibility is explicitly not a goal.** Existing trees will need migrating or
 regenerating. Existing API shapes may be deleted outright rather than deprecated. Where this spec

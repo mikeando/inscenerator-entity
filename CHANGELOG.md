@@ -1,5 +1,66 @@
 # Changelog
 
+## v0.2.0
+
+Storage layout v2. The schema now declares **where** things go, so a caller can create a child
+without knowing the on-disk convention. See `docs/storage-layout.md` for the as-built description
+and `docs/storage-layout-v2.md` for the design argument.
+
+### Breaking
+- `LiveEntity::create_child` and `ChildBuilder::with_child` take a **name** (`&str`), not an
+  `EntityPathEntry`. The edge is resolved from the schema, or overridden with `with_edge`.
+- `ChildContentLayout` is deleted, along with `with_content_inside` / `with_content_parallel` /
+  `with_metadata_inside` / `with_metadata_parallel`. Layout comes from the child's type, or from
+  `with_layout`.
+- `EntityMeta` is a list of observed sources rather than an enum of one. `metadata()` becomes
+  `merged()`; construct with `EntityMeta::of`, or `::at` / `::parallel` / `::inside` /
+  `::in_header` for the single-source cases.
+- `LiveEntity::set_metadata(EntityMeta)` is replaced by `set_meta_key`, `remove_meta_key`,
+  `set_metadata_at` and `clear_metadata`. A source list is an observation, not an instruction.
+- `Schema::add_entity_type` returns `anyhow::Result<()>`: it compiles the type's regexes, so an
+  invalid pattern fails there rather than at a later lookup.
+- `EntityTypeDescription::child_type` is deleted; `CompiledType::match_child` is the one rule
+  matcher.
+- `EntityTypeDescription.ignore` entries are **regexes**, matched like `children` rules, where
+  they were previously exact strings.
+- `EntityTypeDescription` gains `layout`, `ChildEntityRules` gains `edge`, `Entity` gains
+  `layout` and `findings`.
+- `EntityLoader::try_load_entity` takes an `inherited_layout`; new callers should use
+  `try_load_root`.
+- `LiveEntity::new` and `load_from_root` take the schema and a `FindingPolicy`.
+
+### Fixed
+- **C1** — a dot-child's parallel sidecar was computed by *substituting* the extension, so
+  `a/b.review` resolved onto its parent's `a/b.meta.toml`. Writing a dot-child overwrote its
+  parent's metadata, and the loader could not read back what `LiveEntity` wrote. Every suffix is
+  now appended; `with_extension` appears nowhere in `src/`.
+- **C2** — `children()` and `child()` disagreed about a name present on both edges. Both now
+  resolve through `discovery::resolve_children`.
+- **C3** — layout was inferred from the edge, which made a spine file with a folder of children
+  beside it unwritable through the library.
+- **C4** — the schema had no way to say which edge a child attaches on.
+- **C5** — two rule-matching implementations, which could disagree.
+- **C6** — `ignore` was exact-match while `children` was regex.
+- **C7** — a node with mixed layouts failed to load; it now loads, is reported, and stays mixed
+  when an unrelated key is written.
+- **C8** — a rule that matched a name with no files behind it was an error.
+- **C9** — `required` / `multiple` were unenforced *and* unreported; they are now reported.
+- **C10** — a metadata file that did not parse aborted the load. It is now retained with its raw
+  text and error, and written back verbatim.
+- **C11** — the README described root metadata as `project.meta.toml`. The root is always
+  `inside`, so its metadata is `meta.toml` inside the root directory.
+
+### Added
+- `placement` — the single authority for turning an `EntityPath` into a path on disk.
+- `findings` — `Finding`, `FindingKind`, `Severity` and a per-kind `FindingPolicy`
+  (`strict()` / `silent()` presets). Reading is tolerant: drift is reported, not fatal.
+- `discovery` — one child resolver, with cross-pass dedup, intent tie-breaking and per-rule edge
+  observation, shared by the eager loader and the lazy handle.
+- `reading::read_node` — one implementation of a node's type, layout, content and metadata.
+- `Entity::all_findings`, `LiveEntity::issues`, `LiveEntity::intended_layout`,
+  `LiveEntity::observed`.
+- `ChildBuilder::with_edge`, `with_layout`, `with_metadata_at`.
+
 ## v0.1.7
 - Exposed `parse_front_matter` as a public API.
 - Added `LiveEntity::child()` for direct child access by name (checks both slash-path and dot-path forms).

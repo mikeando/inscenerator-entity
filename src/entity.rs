@@ -1,3 +1,7 @@
+//! Entities on disk: the eager reader, the writer, and the types they exchange.
+//!
+//! Section references are to `docs/storage-layout-v2.md`.
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};

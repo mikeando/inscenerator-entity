@@ -1,3 +1,7 @@
+//! The schema: what types exist, what children they allow, and where those go.
+//!
+//! Section references are to `docs/storage-layout-v2.md`.
+
 use std::collections::HashMap;
 use std::path::Path;
 

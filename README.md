@@ -11,34 +11,56 @@ In this library, (almost) everything is an **Entity**. An entity has:
 *   A **Path** (composed of names joined by `/` or `.`).
 *   Optional **Children** (which are also entities).
 
-### Storage Conventions
+### Layout and edge
 
-Entities can be stored on disk using two primary conventions for their content and metadata:
+Where an entity's files land is decided by two declarations, and they are **orthogonal**:
 
-1.  **Inside:** Content is stored at `P/content.md` and metadata at `P/meta.toml`.
-2.  **Parallel:** Content is stored at `P.md` and metadata at `P.meta.toml`.
+*   The child's **type** declares its **layout** — where its own content and metadata sit,
+    relative to its stem `P`:
 
-Both forms cannot exist for the same entity simultaneously.
+    | Layout | Content | Metadata |
+    | --- | --- | --- |
+    | `inside` | `P/content.md` | `P/meta.toml` |
+    | `parallel` | `P.md` | `P.meta.toml` |
+
+*   The parent's **child rule** declares the **edge** — how the child's stem is built from
+    the parent's:
+
+    | Edge | Stem |
+    | --- | --- |
+    | `slash` | `disk(parent)/name` |
+    | `dot` | `disk(parent).name` |
+
+Keeping them apart is what makes the useful shape below expressible: a chapter that is a
+readable `010_chapter-one.md` file (parallel layout) with a `010_chapter-one/` directory of
+scenes beside it (slash edge).
+
+A type that declares no `layout` takes the layout of the parent **instance** it was reached
+under, so a whole subtree can be switched by changing one type. The **root** is always
+`inside`, must be a directory, and has no dot children — there is no filename to prefix.
+
+An entity name may not contain a `.`: `my.file.md` is the entity `my` with a dot-child
+`file`.
 
 #### Example Layout
 
 ```
 my-project/
-├── 010_chapter-one/             <-- "Inside" structure (directory)
-│   ├── content.md               <-- Content for 010_chapter-one
-│   ├── 010_first-scene.md       <-- "Parallel" structure (file)
-│   ├── 020_second-scene.md
-│   └── meta.toml                <-- Metadata for 010_chapter-one
-├── 020_chapter-two.md           <-- "Parallel" structure
-├── 020_chapter-two.notes.md     <-- "Dot-child" of 020_chapter-two
-├── 020_chapter-two.meta.toml    <-- Metadata for 020_chapter-two
-└── project.meta.toml            <-- Metadata for the root project (Parallel)
+├── meta.toml                    <-- metadata for the root itself
+├── 010_chapter-one.md           <-- the chapter's own content ("parallel" layout)
+├── 010_chapter-one.meta.toml    <-- and its metadata
+├── 010_chapter-one/             <-- its children, on the "slash" edge
+│   ├── 010_first-scene.md
+│   └── 020_second-scene.md
+├── 020_chapter-two/             <-- a chapter in "inside" layout instead
+│   ├── content.md
+│   └── meta.toml
+└── 020_chapter-two.notes.md     <-- "notes", a child on the "dot" edge
 ```
 
-In this example:
-*   `010_chapter-one` uses the **Inside** structure: its metadata is in `010_chapter-one/meta.toml`.
-*   `010_first-scene` uses the **Parallel** structure: its content is in `010_chapter-one/010_first-scene.md`.
-*   `020_chapter-two.notes` is a **Dot-child** of `020_chapter-two`.
+The root's metadata is `meta.toml` **inside** the root directory, because the root is always
+`inside`. A file named `project.meta.toml` sitting there is not the root's metadata — it is a
+metadata-only child entity named `project`.
 
 #### Entity Mapping
 
@@ -53,19 +75,24 @@ Project (path: "")
     └── notes (path: "/020_chapter-two.notes")
 ```
 
-### Hierarchy
+### Reading is tolerant
 
-Children of an entity can be associated in two ways:
-1.  **Slash type:** Children are located in a subdirectory (e.g., `P/childname`).
-2.  **Dot type:** Children are located using a dot separator (e.g., `P.childname`).
+A tree that humans edit by hand drifts from its schema. Reading it does not fail: a node
+whose files are not where its type intends still loads, and the difference is recorded as a
+**finding** rather than an error. `Entity.findings` (and `Entity::all_findings()`) carry what
+the eager loader saw; `LiveEntity::issues()` computes the same for one node on demand.
 
-The **Root** element is special: its path is empty, it must represent a directory, and it can only have "Slash type" children.
+Severity is configurable per finding kind through a `FindingPolicy`. Drift defaults to
+`Warn`; ambiguity the library cannot resolve without inventing an answer — a metadata key
+with two different values, a child name found on both edges with no rule to break the tie —
+defaults to `Error`. `FindingPolicy::strict()` refuses any tree that drifts at all;
+`silent()` takes the data and asks no questions.
 
 ## Integration
 
 To use `inscenerator-entity` in your project, add it as a dependency in your `Cargo.toml`.
 
-This library uses `xfs`, a filesystem abstraction crate. This allows you to work with different storage backends (like a real disk via `OsFs` or in-memory for testing via `MockFS`) without changing your logic.
+This library uses `inscenerator-xfs`, a filesystem abstraction crate. This allows you to work with different storage backends (like a real disk via `OsFs` or in-memory for testing via `MockFS`) without changing your logic.
 
 ### Defining Entity Types
 
@@ -78,14 +105,26 @@ A schema can be defined in a `schema.toml` file at the root of your project:
 ```toml
 [Project]
 allow_additional = false
+# Regexes; a child name matching one of these produces no entity at all.
+ignore = ['^\.', '^README\.md$']
 [[Project.children]]
 name_regex = "^[0-9]+_"
 node_type = "Chapter"
 required = false
 multiple = true
+edge = "slash"          # where the child attaches. "slash" is the default.
 
 [Chapter]
 allow_additional = true
+children = []
+layout = "parallel"     # where this type's own files live. Omit to inherit.
+[[Chapter.children]]
+name_regex = "^notes$"
+node_type = "Note"
+edge = "dot"            # 010_chapter-one.notes, beside the chapter file
+
+[Note]
+allow_additional = false
 children = []
 ```
 
@@ -93,7 +132,7 @@ You can then load this schema and the root entity using `load_schema_and_root`:
 
 ```rust
 use inscenerator_entity::schema::load_schema_and_root;
-use xfs::OsFs;
+use inscenerator_xfs::OsFs;
 use std::path::Path;
 
 let fs = OsFs {};
@@ -102,53 +141,67 @@ let (schema, root) = load_schema_and_root(&fs, Path::new("./my-project")).unwrap
 
 #### Programmatic Definition
 
-Alternatively, you can build the schema manually:
+Alternatively, you can build the schema manually. `add_entity_type` compiles the type's
+regexes, so it fails on an invalid one rather than surprising you at load time:
 
 ```rust
-use inscenerator_entity::entity::{EntityTypeDescription, ChildEntityRules, EntityLoader};
-use inscenerator_entity::schema::Schema;
+use inscenerator_entity::entity::EntityLoader;
+use inscenerator_entity::placement::{Edge, Layout};
+use inscenerator_entity::schema::{ChildEntityRules, EntityTypeDescription, Schema};
 
-fn setup_loader() -> EntityLoader {
+fn setup_loader() -> anyhow::Result<EntityLoader> {
     let mut schema = Schema::new();
-
-    // Create a rule for children with a specific prefix
-    let chapter_rule = ChildEntityRules {
-        name_regex: "^[0-9]+_".to_string(),
-        node_type: "Chapter".to_string(),
-        required: false,
-        multiple: true,
-    };
 
     schema.add_entity_type(EntityTypeDescription {
         name: "Project".to_string(),
-        children: vec![chapter_rule],
+        children: vec![ChildEntityRules {
+            name_regex: "^[0-9]+_".to_string(),
+            node_type: "Chapter".to_string(),
+            required: false,
+            multiple: true,
+            edge: Edge::Slash,
+        }],
         allow_additional: false,
-    });
+        ignore: vec![],
+        layout: None,
+    })?;
+    schema.add_entity_type(EntityTypeDescription {
+        name: "Chapter".to_string(),
+        children: vec![],
+        allow_additional: true,
+        ignore: vec![],
+        layout: Some(Layout::Parallel),
+    })?;
 
-    EntityLoader { schema }
+    let mut loader = EntityLoader::new();
+    loader.schema = schema;
+    Ok(loader)
 }
 ```
 
 ### Loading and Saving Entities
 
 ```rust
-use inscenerator_entity::entity::{EntityLoader, EntityWriter, EntityPath};
-use xfs::OsFs;
+use inscenerator_entity::entity::{EntityLoader, EntityWriter};
+use inscenerator_xfs::OsFs;
 use std::path::Path;
 use anyhow::anyhow;
 
 fn main() -> anyhow::Result<()> {
     let mut fs = OsFs {}; // Implementation of Xfs
     let base_path = Path::new("./my-project");
-    let loader = setup_loader();
+    let loader = setup_loader()?;
     let writer = EntityWriter {};
 
-    // Loading an entity tree
+    // Loading an entity tree. The root is always "inside", so it inherits nothing.
     let entity = loader
-        .try_load_entity(&fs, &base_path, &EntityPath::empty(), "Project")?
+        .try_load_root(&fs, &base_path, "Project")?
         .ok_or_else(|| anyhow!("Project not found"))?;
 
     println!("Loaded entity: {}", entity.node_type);
+    for finding in entity.all_findings() {
+        println!("  drift: {}", finding.kind);
+    }
 
     // Saving an entity tree
     writer.write_entity(&mut fs, &base_path, &entity)?;
@@ -159,39 +212,49 @@ fn main() -> anyhow::Result<()> {
 
 ### Creating Children (ChildBuilder)
 
-`LiveEntity::create_child` returns a fluent `ChildBuilder`. Call `.build()` to validate and write to disk. The node type is inferred from the parent schema — use `.with_type()` only when the schema slot is `"Auto"` or `allow_additional = true`.
+`LiveEntity::create_child` takes a **name** and returns a fluent `ChildBuilder`; call
+`.build()` to validate and write to disk. The caller never builds a path: the name is
+matched against the parent's rules, and the rule supplies the type and the edge while the
+resolved type supplies the layout. Use `.with_type()` only when the schema slot is `"Auto"`
+or `allow_additional = true`.
 
 ```rust
-use inscenerator_entity::entity::{EntityMeta, EntityPathEntry, Metadata};
+use inscenerator_entity::entity::Metadata;
 
-// Slash child — type inferred from schema; creates a directory on disk
+// The rule matching "010_chapter-one" says Chapter, on the slash edge; Chapter's type
+// says parallel layout. So: 010_chapter-one.md + 010_chapter-one.meta.toml.
 let chapter = project
-    .create_child(EntityPathEntry::Slash("010_chapter-one".to_string()))
+    .create_child("010_chapter-one")
     .with_content("# Chapter One\n\nOnce upon a time...")
-    .with_metadata_inside(Metadata { value: toml::from_str("title = \"Chapter One\"")? })
+    .with_metadata(Metadata { value: toml::from_str("title = \"Chapter One\"")? })
     .build()?;
 
-// Dot child — lives alongside the parent (e.g. 010_chapter-one.notes.md)
+// The Chapter rule for "notes" declares the dot edge: 010_chapter-one.notes.md
 chapter
-    .create_child(EntityPathEntry::Dot("notes".to_string()))
+    .create_child("notes")
     .with_content("Research notes.")
     .build()?;
 
-// Nested children via with_child
+// Nested children, built in one call
 project
-    .create_child(EntityPathEntry::Slash("020_chapter-two".to_string()))
-    .with_child(EntityPathEntry::Slash("010_first-scene".to_string()), |b| {
-        b.with_content("The scene begins...")
-    })
+    .create_child("020_chapter-two")
+    .with_child("010_first-scene", |b| b.with_content("The scene begins..."))
     .build()?;
 
-// Auto slot — schema allows additional children; concrete type written to meta.toml
+// An additional slot has no rule and therefore no declared type, so supply one; it is
+// written into the child's metadata.
 let item = project
-    .create_child(EntityPathEntry::Slash("epilogue".to_string()))
+    .create_child("epilogue")
     .with_type("Epilogue")
+    .with_content("The end.")
     .build()?;
 // item.actual_type()? == "Epilogue"
 ```
+
+Where a new child lands is resolved, not guessed. If existing children of the same rule all
+sit on one edge, a new one joins them rather than following the declaration — editing a tree
+never fights the convention already established in it. `.with_edge()` and `.with_layout()`
+override each aspect independently when you mean to.
 
 See `examples/create_child.rs` for a complete runnable example.
 

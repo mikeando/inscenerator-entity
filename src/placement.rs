@@ -1,5 +1,7 @@
 //! The single authority for turning an [`EntityPath`] into a path on disk.
 //!
+//! Section references are to `docs/storage-layout-v2.md`.
+//!
 //! Every path is built from the entity's **stem** — [`stem`] — by appending or descending:
 //!
 //! ```text

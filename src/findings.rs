@@ -1,4 +1,6 @@
-//! Drift reporting. §9.1 of `docs/storage-layout-v2.md`.
+//! Drift reporting. §9.1.
+//!
+//! Section references are to `docs/storage-layout-v2.md`.
 //!
 //! Two different things are reported here. **Nonconformance** is "this node disagrees
 //! with its schema" — it has an obvious fix, and a tree humans edit by hand is full of

@@ -3099,3 +3099,84 @@ mod move_tests {
         assert!(err.to_string().contains("Nothing found to move"), "got: {}", err);
     }
 }
+
+/// The strongest check that the writer and the two readers agree: a tree built through
+/// the builder API, read back through both, with nothing to report about it.
+/// Section references are to `docs/storage-layout-v2.md`.
+#[cfg(test)]
+mod round_trip_tests {
+    use super::create_child_tests::{fs_with, tree, SCHEMA};
+    use super::*;
+    use crate::entity::{EntityContent, EntityLoader};
+    use std::sync::Arc;
+
+    /// §5: a readable spine file with a folder of children beside it, plus a dot child
+    /// on the chapter's own filename. Built by `LiveEntity`, read by `EntityLoader`.
+    #[test]
+    fn section_five_tree_round_trips_through_both_readers() {
+        let fs = fs_with(&[]);
+        let schema = Arc::new(Schema::load_from_str(SCHEMA).unwrap());
+        let root = LiveEntity::new(
+            fs.clone(),
+            PathBuf::from("foo"),
+            EntityPath::empty(),
+            "Root".to_string(),
+            schema.clone(),
+        );
+
+        let ch1 = root.create_child("ch1").with_content("Chapter body").build().unwrap();
+        ch1.create_child("010-intro").with_content("Intro body").build().unwrap();
+        ch1.create_child("review").with_content("Review body").build().unwrap();
+
+        assert_eq!(
+            tree(&root),
+            vec![
+                "foo/ch1/",
+                "foo/ch1/010-intro.md",
+                "foo/ch1.md",
+                "foo/ch1.review.md",
+            ]
+        );
+
+        // ---- The eager reader agrees, and has nothing to report.
+        let mut loader = EntityLoader::new();
+        loader.schema = Schema::load_from_str(SCHEMA).unwrap();
+        let loaded = loader
+            .try_load_root(&*fs.lock().unwrap(), Path::new("foo"), "Root")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.all_findings(), vec![]);
+
+        let chapter = &loaded.children[0];
+        assert_eq!(chapter.node_type, "Chapter");
+        assert_eq!(chapter.layout, Layout::Parallel);
+        assert_eq!(chapter.content, EntityContent::Parallel("Chapter body".to_string()));
+
+        // Both sections inherit the chapter instance's parallel layout (§2.1), even
+        // though one is on the slash edge and the other on the dot edge (§3).
+        let kids: Vec<(PathBuf, &str, Layout)> = chapter
+            .children
+            .iter()
+            .map(|c| (c.path.local_path(), c.node_type.as_str(), c.layout))
+            .collect();
+        assert_eq!(
+            kids,
+            vec![
+                (PathBuf::from("ch1/010-intro"), "Section", Layout::Parallel),
+                (PathBuf::from("ch1.review"), "Section", Layout::Parallel),
+            ]
+        );
+
+        // ---- And the lazy reader reaches the same nodes.
+        let live_ch1 = root.child("ch1").unwrap();
+        assert_eq!(live_ch1.actual_type().unwrap(), "Chapter");
+        assert_eq!(live_ch1.content().unwrap(), "Chapter body");
+        assert_eq!(live_ch1.issues().unwrap(), vec![]);
+        for (name, body) in [("010-intro", "Intro body"), ("review", "Review body")] {
+            let kid = live_ch1.child(name).unwrap();
+            assert_eq!(kid.actual_type().unwrap(), "Section");
+            assert_eq!(kid.content().unwrap(), body);
+            assert_eq!(kid.issues().unwrap(), vec![]);
+        }
+    }
+}

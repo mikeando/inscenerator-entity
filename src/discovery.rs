@@ -1,5 +1,7 @@
 //! Child discovery — the single resolver both readers call. §3.1, §4.2, §4.4.
 //!
+//! Section references are to `docs/storage-layout-v2.md`.
+//!
 //! Two passes look for children. The **dot pass** scans the parent directory for entries
 //! prefixed `stem.`; the **slash pass** scans the stem directory itself. Each yields
 //! *names*, not paths: a name may be seen by both passes, and committing to an edge
