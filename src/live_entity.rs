@@ -1,20 +1,79 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::fmt;
 
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use inscenerator_xfs::Xfs;
 
 use std::io::Write;
 
 use crate::entity::{
-    utils, EntityContent, EntityMeta, EntityPath, EntityPathEntry, MetaOrigin, Metadata,
+    utils, EntityContent, EntityMeta, EntityPath, EntityPathEntry, HeaderType, MetaOrigin,
+    MetaSource, MetaState, Metadata,
 };
 use crate::discovery;
 use crate::findings::{Finding, FindingKindId, FindingPolicy, FindingSink};
 use crate::placement::{self, ContentLocation, Layout, MetaLocation};
 use crate::reading;
 use crate::schema::Schema;
+
+/// §4.3 for content: what the node has established wins, and only a node with no content
+/// at all falls back to what its type intends.
+fn resolve_content_location(node: &reading::NodeRead) -> ContentLocation {
+    match node.content {
+        EntityContent::Parallel(_) => ContentLocation::Parallel,
+        EntityContent::Inside(_) => ContentLocation::Inside,
+        EntityContent::None => node.layout.content_location(),
+    }
+}
+
+/// §4.3 for one metadata key: the source that already holds it, else the node's only
+/// source, else what the type intends.
+///
+/// The middle step is what keeps a mixed node mixed (C7) — a new key joins the sidecar
+/// the node actually has rather than creating the one its layout would have chosen.
+fn resolve_meta_location(node: &reading::NodeRead, key: &str) -> MetaLocation {
+    if let Some(location) = node.metadata.location_of(key) {
+        return location;
+    }
+    let locations = node.metadata.locations();
+    if locations.len() == 1 {
+        return locations[0];
+    }
+    node.layout.sidecar_location()
+}
+
+/// Front matter as it should appear above `body`.
+///
+/// A source that did not parse is put back inside its delimiters exactly as it was found,
+/// so rewriting the body never destroys a header the library could not read (D3).
+fn header_text(source: &MetaSource, body: &str) -> anyhow::Result<String> {
+    let MetaOrigin::Header { header_type, separator } = &source.origin else {
+        bail!("not front matter: {:?}", source.origin);
+    };
+    let m = match &source.state {
+        MetaState::Parsed(m) => {
+            return utils::format_metadata_header(m, *header_type, separator.as_deref(), body)
+        }
+        MetaState::Malformed { raw, .. } => raw,
+    };
+    let (open, close) = match header_type {
+        HeaderType::Toml => ("```toml\n", "```\n"),
+        HeaderType::Yaml => ("---\n", "---\n"),
+    };
+    let mut out = String::from(open);
+    out.push_str(m);
+    if !m.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(close);
+    match separator {
+        Some(s) => out.push_str(s),
+        None if !body.starts_with('\n') => out.push('\n'),
+        None => {}
+    }
+    Ok(out)
+}
 
 /// Shared context for a tree of LiveEntities.
 pub struct LiveEntityRoot {
@@ -667,24 +726,6 @@ impl LiveEntity {
             .expect("a sidecar location always has a path")
     }
 
-    /// The content file this node reads from: `(raw_text, is_parallel, path)`.
-    ///
-    /// Where both content files exist the intended layout picks one and the other is
-    /// reported (§4.4); where neither exists the path is where intent says a write would
-    /// go, so a caller creating content has somewhere to put it.
-    fn get_content_info(&self) -> anyhow::Result<(Option<String>, bool, PathBuf)> {
-        let node = self.read(CONTENT_FINDINGS)?;
-        let location = match node.content {
-            EntityContent::Parallel(_) => ContentLocation::Parallel,
-            EntityContent::Inside(_) => ContentLocation::Inside,
-            EntityContent::None => node.layout.content_location(),
-        };
-        let path = placement::content_path(&self.root.base_path, &self.path, location);
-        let fs = self.root.fs.lock().unwrap();
-        let raw = utils::try_load_file_as_string(&*fs, &path)?;
-        Ok((raw, location == ContentLocation::Parallel, path))
-    }
-
     /// Reads the content of the entity from disk.
     ///
     /// # Errors
@@ -748,138 +789,178 @@ impl LiveEntity {
 
     /// Updates the content of the entity on disk.
     ///
+    /// The content goes where this node already keeps its content; only a node with no
+    /// content at all follows what its type intends (§4.3). A write is never a
+    /// relocation. Front matter shares the content file, so it is written back above the
+    /// new body — setting content is not an edit to metadata.
+    ///
     /// # Errors
     ///
     /// Returns an error if disk access fails.
     pub fn set_content(&self, new_content: &str) -> anyhow::Result<()> {
-        let current_meta = self.metadata()?;
-        let (content_str, _is_parallel, path) = self.get_content_info()?;
+        let node = self.read(CONTENT_FINDINGS)?;
+        let path = placement::content_path(
+            &self.root.base_path,
+            &self.path,
+            resolve_content_location(&node),
+        );
 
-        let mut to_write = String::new();
-        if let Some(source) = current_meta.source_at(MetaLocation::InHeader) {
-            if let (MetaOrigin::Header { header_type, separator }, Some(m)) =
-                (&source.origin, source.metadata())
-            {
-                to_write.push_str(&utils::format_metadata_header(
-                    m,
-                    *header_type,
-                    separator.as_deref(),
-                    new_content,
-                )?);
-            }
-        }
-        to_write.push_str(new_content);
-
-        let final_path = if content_str.is_none() {
-            let fs = self.root.fs.lock().unwrap();
-            if self.path.entries.is_empty() || fs.is_dir(&self.on_disk_path()) {
-                self.slash_content_path()
-            } else {
-                self.dot_content_path()
-            }
-            // fs dropped here
-        } else {
-            path
+        let mut to_write = match node.metadata.source_at(MetaLocation::InHeader) {
+            Some(source) => header_text(source, new_content)?,
+            None => String::new(),
         };
-
-        let mut fs = self.root.fs.lock().unwrap();
-        if let Some(parent) = final_path.parent() {
-            fs.create_dir_all(parent)?;
-        }
-        let mut writer = fs.writer(&final_path)?;
-        writer.write_all(to_write.as_bytes())?;
-        Ok(())
+        to_write.push_str(new_content);
+        self.write_file(&path, &to_write)
     }
 
-    /// Updates the metadata of the entity on disk.
+    /// Sets one metadata key, routed per §4.5. Nothing else moves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if disk access fails, or if the key routes to a source that did
+    /// not parse — the library will not merge a key into text it does not understand.
+    pub fn set_meta_key(&self, key: &str, value: toml::Value) -> anyhow::Result<()> {
+        self.edit_meta_key(key, Some(value))
+    }
+
+    /// Removes one metadata key from the source that holds it. A source emptied this way
+    /// stays: removing a key is not removing a source, which is [`Self::clear_metadata`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_meta_key`]. Removing a key the node does not have is not an error,
+    /// and touches nothing.
+    pub fn remove_meta_key(&self, key: &str) -> anyhow::Result<()> {
+        self.edit_meta_key(key, None)
+    }
+
+    /// Reads one source, changes one key in it, and writes that source back.
+    fn edit_meta_key(&self, key: &str, value: Option<toml::Value>) -> anyhow::Result<()> {
+        let node = self.read(METADATA_FINDINGS)?;
+        if value.is_none() && node.metadata.location_of(key).is_none() {
+            return Ok(());
+        }
+        let location = resolve_meta_location(&node, key);
+
+        let mut table = match node.metadata.source_at(location) {
+            Some(source) => match &source.state {
+                MetaState::Parsed(m) => m
+                    .value
+                    .as_table()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Metadata at {:?} is not a table", location))?,
+                // D3: replacing the source wholesale is the way to repair one of these.
+                MetaState::Malformed { .. } => bail!(
+                    "Cannot edit metadata in {}: it is not valid TOML. Fix the file, or \
+                     replace its contents outright.",
+                    self.meta_file_name(location)
+                ),
+            },
+            None => toml::map::Map::new(),
+        };
+        match value {
+            Some(v) => {
+                table.insert(key.to_string(), v);
+            }
+            None => {
+                table.remove(key);
+            }
+        }
+        self.write_meta_source(&node, location, &Metadata { value: toml::Value::Table(table) })
+    }
+
+    /// Replaces one metadata source outright, whatever was there before.
+    ///
+    /// Explicit, for a caller that means it — and the way to repair a source that did not
+    /// parse (D3), since nothing here has to read what it is replacing.
     ///
     /// # Errors
     ///
     /// Returns an error if disk access fails.
-    pub fn set_metadata(&self, meta: EntityMeta) -> anyhow::Result<()> {
-        let current_meta = self.metadata()?;
-        let current_content = self.content()?;
-        let (content_str, _, content_path) = self.get_content_info()?;
+    pub fn set_metadata_at(&self, location: MetaLocation, metadata: Metadata) -> anyhow::Result<()> {
+        // Read with no findings owned: a wholesale replacement does not depend on the
+        // metadata being readable, so a policy that rates it an error must not block the
+        // one operation that fixes it.
+        let node = self.read(&[])?;
+        self.write_meta_source(&node, location, &metadata)
+    }
 
-        let mut fs = self.root.fs.lock().unwrap();
-
-        if current_meta.source_at(MetaLocation::InHeader).is_some() {
-            if meta.source_at(MetaLocation::InHeader).is_none() {
-                if let Some(c) = &content_str {
-                     let a = match utils::parse_header(&c) {
-                         Some((_, _, a, _)) => a,
-                         None => c.clone(),
-                     };
-                     let mut writer = fs.writer(&content_path)?;
-                     writer.write_all(a.as_bytes())?;
+    /// Removes every metadata source this node has, front matter included.
+    ///
+    /// The content is not metadata: it survives having a header stripped off it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if disk access fails.
+    pub fn clear_metadata(&self) -> anyhow::Result<()> {
+        let node = self.read(&[])?;
+        for location in node.metadata.locations() {
+            match placement::sidecar_path(&self.root.base_path, &self.path, location) {
+                Some(path) => {
+                    let mut fs = self.root.fs.lock().unwrap();
+                    fs.remove_file(&path)?;
+                }
+                None => {
+                    let body = node.content.content().unwrap_or("").to_string();
+                    let path = placement::content_path(
+                        &self.root.base_path,
+                        &self.path,
+                        resolve_content_location(&node),
+                    );
+                    self.write_file(&path, &body)?;
                 }
             }
         }
+        Ok(())
+    }
 
-        // Any sidecar the node had but the new metadata does not is removed.
-        for location in current_meta.locations() {
-            if meta.source_at(location).is_some() {
-                continue;
-            }
-            match location {
-                MetaLocation::InHeader => {}
-                MetaLocation::ParallelSidecar => {
-                    let _ = fs.remove_file(&self.dot_metadata_path());
+    /// Writes one whole metadata source. In-header metadata shares the content file, so
+    /// writing it means writing the body back out underneath it.
+    fn write_meta_source(
+        &self,
+        node: &reading::NodeRead,
+        location: MetaLocation,
+        metadata: &Metadata,
+    ) -> anyhow::Result<()> {
+        let Some(path) = placement::sidecar_path(&self.root.base_path, &self.path, location) else {
+            let body = node.content.content().unwrap_or("");
+            // The shape of front matter belongs to the file it is in, not to the caller.
+            let (header_type, separator) = match node.metadata.source_at(MetaLocation::InHeader) {
+                Some(MetaSource { origin: MetaOrigin::Header { header_type, separator }, .. }) => {
+                    (*header_type, separator.clone())
                 }
-                MetaLocation::InsideSidecar => {
-                    let _ = fs.remove_file(&self.slash_metadata_path());
-                }
-            }
-        }
-
-        for source in meta.sources() {
-            let Some(m) = source.metadata() else {
-                bail!(
-                    "Refusing to write a metadata source that did not parse at {:?}",
-                    self.on_disk_path()
-                );
+                _ => (HeaderType::Toml, None),
             };
-            match &source.origin {
-                MetaOrigin::ParallelSidecar => {
-                    let toml_str = toml::to_string(&m.value)?;
-                    let path = self.dot_metadata_path();
-                    if let Some(parent) = path.parent() {
-                        fs.create_dir_all(parent)?;
-                    }
-                    fs.writer(&path)?.write_all(toml_str.as_bytes())?;
-                }
-                MetaOrigin::InsideSidecar => {
-                    let toml_str = toml::to_string(&m.value)?;
-                    let path = self.slash_metadata_path();
-                    fs.create_dir_all(path.parent().unwrap())?;
-                    fs.writer(&path)?.write_all(toml_str.as_bytes())?;
-                }
-                MetaOrigin::Header { header_type, separator } => {
-                    let content_body = current_content.content().unwrap_or("");
-                    let to_write = utils::format_metadata_header(
-                        m,
-                        *header_type,
-                        separator.as_deref(),
-                        content_body,
-                    )? + content_body;
+            let text = utils::format_metadata_header(
+                metadata,
+                header_type,
+                separator.as_deref(),
+                body,
+            )? + body;
+            let path = placement::content_path(
+                &self.root.base_path,
+                &self.path,
+                resolve_content_location(node),
+            );
+            return self.write_file(&path, &text);
+        };
+        self.write_file(&path, &toml::to_string(&metadata.value)?)
+    }
 
-                    let final_path = if current_content.is_none() {
-                        if self.path.entries.is_empty() {
-                            self.slash_content_path()
-                        } else {
-                            self.dot_content_path()
-                        }
-                    } else {
-                        content_path.clone()
-                    };
-
-                    if let Some(parent) = final_path.parent() {
-                        fs.create_dir_all(parent)?;
-                    }
-                    fs.writer(&final_path)?.write_all(to_write.as_bytes())?;
-                }
-            }
+    /// The file a metadata location lives in, for a message a person has to act on.
+    fn meta_file_name(&self, location: MetaLocation) -> String {
+        match placement::sidecar_path(&self.root.base_path, &self.path, location) {
+            Some(p) => p.display().to_string(),
+            None => format!("the front matter of {}", self.on_disk_path().display()),
         }
+    }
+
+    fn write_file(&self, path: &Path, text: &str) -> anyhow::Result<()> {
+        let mut fs = self.root.fs.lock().unwrap();
+        if let Some(parent) = path.parent() {
+            fs.create_dir_all(parent)?;
+        }
+        fs.writer(path)?.write_all(text.as_bytes())?;
         Ok(())
     }
 
@@ -1091,7 +1172,6 @@ impl LiveEntity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity::HeaderType;
     use inscenerator_xfs::mockfs;
     use inscenerator_xfs::XfsReadOnly;
     use crate::placement::Edge;
@@ -1130,9 +1210,12 @@ mod tests {
         Arc::new(schema)
     }
 
+    /// A YAML header is written back as YAML: the shape of front matter belongs to the
+    /// file it is in, not to the caller changing a key in it.
     #[test]
     fn test_live_entity_yaml_write() {
-        let fs = mockfs::MockFS::new();
+        let mut fs = mockfs::MockFS::new();
+        create_file_with_content(&mut fs, "foo", "entity1.md", "---\nkey: val\n---\nHello");
         let fs = Arc::new(Mutex::new(fs));
         let schema = setup_schema();
 
@@ -1144,16 +1227,11 @@ mod tests {
             schema,
         );
 
-        let mut meta_val = toml::map::Map::new();
-        meta_val.insert("key".to_string(), toml::Value::String("val".to_string()));
-        let meta = crate::entity::Metadata { value: toml::Value::Table(meta_val) };
-
-        live.set_metadata(EntityMeta::in_header(live.path.clone(), meta, None, HeaderType::Yaml))
-            .unwrap();
-        live.set_content("Hello").unwrap();
+        live.set_meta_key("key", toml::Value::String("other".to_string())).unwrap();
 
         let content = crate::entity::utils::try_load_file_as_string(&*live.root.fs.lock().unwrap(), &PathBuf::from("foo/entity1.md")).unwrap().unwrap();
-        assert!(content.contains("---\nkey: val\n---\n"));
+        assert!(content.contains("---\nkey: other\n---\n"), "got: {:?}", content);
+        assert!(content.ends_with("Hello"), "the body survives: {:?}", content);
     }
 
     #[test]
@@ -1206,13 +1284,16 @@ mod tests {
             schema,
         );
 
-        // 1. set_content
+        // 1. set_content. Nothing is established here, so intent decides: `Type` declares
+        // no layout and this handle was built by address, so it inherits `Inside`. This
+        // used to come out `Parallel`, from a heuristic that read the absence of a
+        // directory as a decision the node had made.
         live.set_content("New content").unwrap();
-        assert_eq!(live.content().unwrap(), EntityContent::parallel("New content"));
+        assert_eq!(live.content().unwrap(), EntityContent::inside("New content"));
 
-        // 2. set_metadata (Inside)
+        // 2. set_metadata_at (Inside)
         let meta = crate::entity::Metadata { value: toml::from_str("a = 1").unwrap() };
-        live.set_metadata(EntityMeta::inside(live.path.clone(), meta.clone())).unwrap();
+        live.set_metadata_at(MetaLocation::InsideSidecar, meta.clone()).unwrap();
         assert_eq!(live.metadata().unwrap(), EntityMeta::inside(live.path.clone(), meta));
 
         // 3. create_child
@@ -1237,7 +1318,13 @@ mod tests {
             schema,
         );
 
-        live.set_metadata(EntityMeta::default()).unwrap();
+        live.clear_metadata().unwrap();
+
+        assert!(live.metadata().unwrap().is_none());
+        assert!(
+            !live.root.fs.lock().unwrap().is_file(&PathBuf::from("foo/entity1.meta.toml")),
+            "the sidecar is gone, not merely emptied"
+        );
     }
 
     #[test]
@@ -2157,7 +2244,7 @@ mod live_read_tests {
     /// Root (inside) > Chapter (parallel) > Section. `notes` is declared on the slash
     /// edge and `review` on the dot edge; Section declares no layout of its own, so it
     /// takes the layout of the Chapter instance it is reached through.
-    const SCHEMA: &str = r#"
+    pub(super) const SCHEMA: &str = r#"
 [Root]
 allow_additional = false
 [[Root.children]]
@@ -2349,5 +2436,264 @@ children = []
         let bad = meta.malformed();
         assert_eq!(bad.len(), 1);
         assert!(bad[0].raw().unwrap().contains("not toml"));
+    }
+}
+
+#[cfg(test)]
+mod live_write_tests {
+    use super::live_read_tests::SCHEMA;
+    use super::*;
+    use inscenerator_xfs::mockfs;
+    use std::collections::BTreeMap;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    /// A content file carrying front matter, so a node can have metadata in two places
+    /// at once. Round-trips exactly: the body below the `---` is `body`.
+    const HEADER: &str = "```toml\nowner = \"hand\"\n```\n---\nbody";
+
+    /// The files on disk before, and the one file the write is expected to touch.
+    type ContentCase<'a> = (&'a [(&'a str, &'a str)], &'a str, &'a str);
+    /// As [`ContentCase`], with the key being written.
+    type MetaCase<'a> = (&'a [(&'a str, &'a str)], &'a str, &'a str, &'a str);
+
+    fn meta(src: &str) -> Metadata {
+        Metadata { value: toml::from_str(src).unwrap() }
+    }
+
+    /// A handle on `ch1`, typed `Chapter` — which declares `layout = "parallel"`, so
+    /// intent and what is on disk can be made to disagree. Built by address rather than
+    /// through `child()`: these tests are about where a write lands, not about discovery.
+    fn ch1_handle(files: &[(&str, &str)]) -> LiveEntity {
+        let mut fs = mockfs::MockFS::new();
+        fs.create_dir_all(&PathBuf::from("foo")).unwrap();
+        for (path, content) in files {
+            let p = PathBuf::from(path);
+            fs.create_dir_all(p.parent().unwrap()).unwrap();
+            fs.add_r(&p, content.as_bytes().to_vec()).unwrap();
+        }
+        LiveEntity::new(
+            Arc::new(Mutex::new(fs)),
+            PathBuf::from("foo"),
+            EntityPath::empty().extend_slash("ch1"),
+            "Chapter".to_string(),
+            Arc::new(Schema::load_from_str(SCHEMA).unwrap()),
+        )
+    }
+
+    /// Every file under the tree, with its contents.
+    fn snapshot(live: &LiveEntity) -> BTreeMap<String, String> {
+        fn walk(fs: &dyn Xfs, dir: &Path, out: &mut BTreeMap<String, String>) {
+            let entries: Vec<PathBuf> =
+                fs.read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+            for p in entries {
+                if fs.is_dir(&p) {
+                    walk(fs, &p, out);
+                } else {
+                    let text = utils::try_load_file_as_string(fs, &p).unwrap().unwrap_or_default();
+                    out.insert(p.display().to_string(), text);
+                }
+            }
+        }
+        let fs = live.root.fs.lock().unwrap();
+        let mut out = BTreeMap::new();
+        walk(&*fs, &live.root.base_path, &mut out);
+        out
+    }
+
+    /// The files `f` created, deleted or rewrote. Most of the assertions below are about
+    /// this list being *short*: a write routes to one file and leaves the rest alone.
+    fn files_changed_by(live: &LiveEntity, f: impl FnOnce(&LiveEntity)) -> Vec<String> {
+        let before = snapshot(live);
+        f(live);
+        let after = snapshot(live);
+        let mut paths: Vec<String> = before.keys().chain(after.keys()).cloned().collect();
+        paths.sort();
+        paths.dedup();
+        paths.retain(|p| before.get(p) != after.get(p));
+        paths
+    }
+
+    /// §4.3: content is written where the node already keeps its content, and only a
+    /// node with none falls back to what its type intends.
+    #[test]
+    fn set_content_lands_where_4_3_says() {
+        let cases: &[ContentCase] = &[
+            (&[], "foo/ch1.md", "nothing is established, so the type's intent decides"),
+            (
+                &[("foo/ch1/content.md", "old")],
+                "foo/ch1/content.md",
+                "content already lives inside, and a write is not a relocation",
+            ),
+            (&[("foo/ch1.md", "old")], "foo/ch1.md", "content already lives beside"),
+        ];
+        for (files, expected, why) in cases {
+            let ch1 = ch1_handle(files);
+            let changed = files_changed_by(&ch1, |e| e.set_content("new").unwrap());
+            assert_eq!(changed, vec![expected.to_string()], "{}", why);
+            assert_eq!(ch1.content().unwrap(), "new", "{}", why);
+        }
+    }
+
+    /// §4.3: a content write must not destroy the metadata that shares its file.
+    #[test]
+    fn set_content_keeps_the_header_above_it() {
+        let ch1 = ch1_handle(&[("foo/ch1.md", HEADER)]);
+        ch1.set_content("new body").unwrap();
+
+        assert_eq!(ch1.content().unwrap(), "new body");
+        assert_eq!(ch1.metadata().unwrap().get_str("owner").unwrap().as_deref(), Some("hand"));
+    }
+
+    /// §4.5: one key is written to one source, chosen by where that key already lives,
+    /// else the node's only source, else the type's intent. Nothing else moves — which
+    /// is what `changed` proves in each case.
+    #[test]
+    fn set_meta_key_lands_where_4_5_says() {
+        let sidecar = ("foo/ch1.meta.toml", "word_count = 1\n");
+        let inside_sidecar = ("foo/ch1/meta.toml", "word_count = 1\n");
+        let cases: &[MetaCase] = &[
+            (
+                &[("foo/ch1.md", HEADER)],
+                "owner",
+                "foo/ch1.md",
+                "the source that already holds the key",
+            ),
+            (
+                &[("foo/ch1.md", HEADER), sidecar],
+                "word_count",
+                "foo/ch1.meta.toml",
+                "the source that holds the key, not the first source that exists",
+            ),
+            (
+                &[("foo/ch1.md", HEADER), sidecar],
+                "added",
+                "foo/ch1.meta.toml",
+                "a new key on a node with two sources follows intent",
+            ),
+            (
+                &[("foo/ch1.md", "body"), inside_sidecar],
+                "added",
+                "foo/ch1/meta.toml",
+                "C7: the node's only source wins over intent, so a mixed node is not normalised",
+            ),
+            (
+                &[("foo/ch1.md", "body")],
+                "added",
+                "foo/ch1.meta.toml",
+                "no metadata at all, so intent — the parallel sidecar — and it is created",
+            ),
+            (
+                &[("foo/ch1.md", HEADER)],
+                "added",
+                "foo/ch1.md",
+                "the header is the node's only source, so a new key joins it",
+            ),
+        ];
+        for (files, key, expected, why) in cases {
+            let ch1 = ch1_handle(files);
+            let changed =
+                files_changed_by(&ch1, |e| e.set_meta_key(key, toml::Value::Integer(7)).unwrap());
+            assert_eq!(changed, vec![expected.to_string()], "{}", why);
+
+            let merged = ch1.metadata().unwrap().merged().unwrap().unwrap();
+            assert_eq!(merged.value.get(*key).unwrap().as_integer(), Some(7), "{}", why);
+        }
+    }
+
+    /// §4.5: routing a key to the header rewrites the front matter and nothing else —
+    /// in particular not the body underneath it.
+    #[test]
+    fn setting_a_key_in_the_header_leaves_the_body_alone() {
+        let ch1 = ch1_handle(&[("foo/ch1.md", HEADER)]);
+        ch1.set_meta_key("owner", toml::Value::String("robot".into())).unwrap();
+
+        assert_eq!(ch1.content().unwrap(), "body");
+        assert_eq!(ch1.metadata().unwrap().get_str("owner").unwrap().as_deref(), Some("robot"));
+    }
+
+    /// §4.5: removal is routed exactly as setting is — from the source holding the key.
+    #[test]
+    fn removing_a_key_takes_it_out_of_the_source_that_holds_it() {
+        let ch1 = ch1_handle(&[("foo/ch1.md", HEADER), ("foo/ch1.meta.toml", "word_count = 1\n")]);
+        let changed = files_changed_by(&ch1, |e| e.remove_meta_key("word_count").unwrap());
+        assert_eq!(changed, vec!["foo/ch1.meta.toml".to_string()]);
+
+        let m = ch1.metadata().unwrap();
+        assert_eq!(m.get_str("owner").unwrap().as_deref(), Some("hand"), "the header is untouched");
+        assert!(m.merged().unwrap().unwrap().value.get("word_count").is_none());
+        assert_eq!(
+            ch1.observed().unwrap().metadata,
+            vec![MetaLocation::InHeader, MetaLocation::ParallelSidecar],
+            "an emptied sidecar stays: removing a key is not removing a source"
+        );
+    }
+
+    /// §4.5: the explicit route, for a caller replacing one whole source on purpose.
+    #[test]
+    fn set_metadata_at_replaces_one_source_and_leaves_the_others() {
+        let ch1 = ch1_handle(&[("foo/ch1.md", HEADER), ("foo/ch1.meta.toml", "word_count = 1\n")]);
+        let changed = files_changed_by(&ch1, |e| {
+            e.set_metadata_at(MetaLocation::ParallelSidecar, meta("stage = \"draft\"")).unwrap()
+        });
+        assert_eq!(changed, vec!["foo/ch1.meta.toml".to_string()]);
+
+        let m = ch1.metadata().unwrap();
+        assert_eq!(m.get_str("stage").unwrap().as_deref(), Some("draft"));
+        assert_eq!(m.get_str("owner").unwrap().as_deref(), Some("hand"), "the header is untouched");
+        let merged = m.merged().unwrap().unwrap();
+        assert!(merged.value.get("word_count").is_none(), "a replacement, not a merge");
+    }
+
+    /// §4.5: clearing removes every source, front matter included. The content is not
+    /// metadata, so it survives having the header stripped off it.
+    #[test]
+    fn clear_metadata_removes_every_source_and_keeps_the_body() {
+        let ch1 = ch1_handle(&[("foo/ch1.md", HEADER), ("foo/ch1.meta.toml", "word_count = 1\n")]);
+        ch1.clear_metadata().unwrap();
+
+        assert!(ch1.metadata().unwrap().is_none());
+        assert_eq!(ch1.observed().unwrap().metadata, vec![]);
+        assert_eq!(ch1.content().unwrap(), "body");
+    }
+
+    /// D3: a source the library could not parse is still replaceable wholesale — that is
+    /// how a caller repairs one.
+    #[test]
+    fn a_malformed_source_is_repairable_by_wholesale_replacement() {
+        let ch1 =
+            ch1_handle(&[("foo/ch1.md", "body"), ("foo/ch1.meta.toml", "this = = not toml")]);
+        ch1.set_metadata_at(MetaLocation::ParallelSidecar, meta("word_count = 3")).unwrap();
+
+        let m = ch1.metadata().unwrap();
+        assert!(m.malformed().is_empty());
+        assert_eq!(
+            m.merged().unwrap().unwrap().value.get("word_count").unwrap().as_integer(),
+            Some(3)
+        );
+    }
+
+    /// D3: and it is removable, which is the other way to get rid of one.
+    #[test]
+    fn clear_metadata_removes_a_malformed_source() {
+        let ch1 =
+            ch1_handle(&[("foo/ch1.md", "body"), ("foo/ch1.meta.toml", "this = = not toml")]);
+        ch1.clear_metadata().unwrap();
+
+        assert!(ch1.metadata().unwrap().is_none());
+    }
+
+    /// D3: but the library will not merge a key into text it could not parse — that
+    /// would mean writing back a file whose contents it does not understand. The refusal
+    /// names the file, because that is what the person fixing it has to open; a Rust
+    /// method name would be noise in the tooling these errors surface through.
+    #[test]
+    fn set_meta_key_refuses_to_edit_a_source_it_could_not_parse() {
+        let ch1 =
+            ch1_handle(&[("foo/ch1.md", "body"), ("foo/ch1.meta.toml", "this = = not toml")]);
+        let err = ch1.set_meta_key("added", toml::Value::Integer(1)).unwrap_err().to_string();
+
+        assert!(err.contains("foo/ch1.meta.toml"), "the message names the file: {}", err);
+        assert!(!err.contains("set_metadata_at"), "no Rust API in the message: {}", err);
     }
 }
