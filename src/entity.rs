@@ -917,19 +917,31 @@ impl EntityWriter {
         base_path: &Path,
         entity: &Entity,
     ) -> anyhow::Result<()> {
-        let entity_path = entity.path.to_pathbuf(base_path);
+        // Where the content goes is read from the `EntityContent` variant, which records
+        // where this node's content actually is. `entity.layout` is only the *intent*,
+        // and a node whose two halves disagree (C7) must be written back as it stands —
+        // a save is not the place to normalise a tree.
+        let content_location = match &entity.content {
+            EntityContent::Parallel(_) => Some(ContentLocation::Parallel),
+            EntityContent::Inside(_) => Some(ContentLocation::Inside),
+            EntityContent::None => None,
+        };
 
         let is_empty =
             entity.content.is_none() && entity.metadata.is_none() && entity.children.is_empty();
+        // The directory is created exactly when something must live in it: a file this
+        // call is about to write, a child on the slash edge, or — for a node with nothing
+        // at all — the directory itself, as its only trace on disk. All of that is read
+        // off the entity; nothing here probes the filesystem.
         let needs_directory = is_empty
-            || entity.content.is_inside()
+            || content_location == Some(ContentLocation::Inside)
             || entity.metadata.source_at(MetaLocation::InsideSidecar).is_some()
             || entity
                 .children
                 .iter()
                 .any(|c: &Entity| c.path.entries.last().unwrap().is_slash());
         if needs_directory {
-            fs.create_dir_all(&entity_path)?;
+            fs.create_dir_all(&placement::stem(base_path, &entity.path))?;
         }
 
         let header_source = entity.metadata.source_at(MetaLocation::InHeader);
@@ -954,11 +966,8 @@ impl EntityWriter {
             }
             to_write.push_str(content);
 
-            let path = match &entity.content {
-                EntityContent::Parallel(_) => entity_path.with_added_extension("md"),
-                EntityContent::Inside(_) => entity_path.join("content.md"),
-                _ => unreachable!(),
-            };
+            let location = content_location.expect("content() is Some, so is its location");
+            let path = placement::content_path(base_path, &entity.path, location);
             fs.writer(&path)?.write_all(to_write.as_bytes())?;
         } else if header_source.is_some() {
             bail!(
@@ -969,12 +978,10 @@ impl EntityWriter {
 
         // Every sidecar source is written, so a node carrying more than one round-trips.
         for source in entity.metadata.sources() {
-            let path = match source.location() {
-                MetaLocation::InHeader => continue,
-                // TODO(Task 7): route through placement, which appends rather than
-                // substitutes. `with_extension` here is C1.
-                MetaLocation::ParallelSidecar => entity_path.with_extension("meta.toml"),
-                MetaLocation::InsideSidecar => entity_path.join("meta.toml"),
+            // `None` is the header, already written above as part of the content file.
+            let Some(path) = placement::sidecar_path(base_path, &entity.path, source.location())
+            else {
+                continue;
             };
             let text = match &source.state {
                 MetaState::Parsed(m) => toml::to_string(&m.value)?,
@@ -1019,10 +1026,6 @@ impl EntityContent {
 
     pub fn inside<S: Into<String>>(s: S) -> EntityContent {
         EntityContent::Inside(s.into())
-    }
-
-    fn is_inside(&self) -> bool {
-        matches!(self, EntityContent::Inside(_))
     }
 }
 
@@ -3186,5 +3189,180 @@ children = []
         let all = root.all_findings();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].path, section.path, "a finding carries its own node's path");
+    }
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+    use crate::schema::Schema;
+    use inscenerator_xfs::{mockfs, XfsReadOnly};
+    use std::path::PathBuf;
+
+    /// The same tree shape `loader_tests` uses: Root (inside) > Chapter (parallel) >
+    /// Section, reachable on either the slash or the dot edge.
+    const SCHEMA: &str = r#"
+[Root]
+allow_additional = false
+[[Root.children]]
+name_regex = "^ch"
+node_type = "Chapter"
+
+[Chapter]
+allow_additional = false
+layout = "parallel"
+[[Chapter.children]]
+name_regex = '^\d{3}-'
+node_type = "Section"
+edge = "slash"
+[[Chapter.children]]
+name_regex = "^review$"
+node_type = "Section"
+edge = "dot"
+
+[Section]
+allow_additional = false
+children = []
+"#;
+
+    fn loader() -> EntityLoader {
+        let mut loader = EntityLoader::new();
+        loader.schema = Schema::load_from_str(SCHEMA).unwrap();
+        loader
+    }
+
+    /// Writes `files` under `foo/`, loads that tree, and writes it back out under
+    /// `bar/`. Loading is `loader_tests`' subject; what is under test here is the copy
+    /// that comes back out, so every assertion below reads from `bar/`.
+    fn round_trip(files: &[(&str, &str)]) -> mockfs::MockFS {
+        let mut fs = mockfs::MockFS::new();
+        fs.create_dir_all(&PathBuf::from("foo")).unwrap();
+        for (path, content) in files {
+            let p = PathBuf::from(path);
+            fs.create_dir_all(p.parent().unwrap()).unwrap();
+            fs.add_r(&p, content.as_bytes().to_vec()).unwrap();
+        }
+        let tree = loader()
+            .try_load_root(&fs, &PathBuf::from("foo"), "Root")
+            .unwrap()
+            .unwrap();
+        EntityWriter {}
+            .write_entity(&mut fs, &PathBuf::from("bar"), &tree)
+            .unwrap();
+        fs
+    }
+
+    fn read(fs: &mockfs::MockFS, path: &str) -> String {
+        fs.read_to_string(&PathBuf::from(path))
+            .unwrap_or_else(|e| panic!("reading {}: {}", path, e))
+    }
+
+    fn exists(fs: &mockfs::MockFS, path: &str) -> bool {
+        fs.is_file(&PathBuf::from(path))
+    }
+
+    /// C1: a dot child's sidecar suffix is **appended** to its own stem. Substituting
+    /// it resolved `ch1.review` onto `ch1.meta.toml`, and since children are written
+    /// after their parent, the child's metadata replaced the parent's every time.
+    #[test]
+    fn writing_a_dot_child_does_not_clobber_the_parents_sidecar() {
+        let fs = round_trip(&[
+            ("foo/ch1.md", "chapter body"),
+            ("foo/ch1.meta.toml", "owner = \"parent\""),
+            ("foo/ch1.review.md", "review body"),
+            ("foo/ch1.review.meta.toml", "owner = \"child\""),
+        ]);
+
+        assert!(read(&fs, "bar/ch1.meta.toml").contains("parent"));
+        assert!(read(&fs, "bar/ch1.review.meta.toml").contains("child"));
+        assert_eq!(read(&fs, "bar/ch1.md"), "chapter body");
+        assert_eq!(read(&fs, "bar/ch1.review.md"), "review body");
+    }
+
+    /// C1, closing the loop: the loader reads back what the writer wrote, with the two
+    /// owners still distinct and nothing about the copy drifting from its schema.
+    #[test]
+    fn dot_child_parallel_sidecar_round_trips() {
+        let fs = round_trip(&[
+            ("foo/ch1.md", "chapter body"),
+            ("foo/ch1.meta.toml", "owner = \"parent\""),
+            ("foo/ch1.review.md", "review body"),
+            ("foo/ch1.review.meta.toml", "owner = \"child\""),
+        ]);
+
+        let root = loader()
+            .try_load_root(&fs, &PathBuf::from("bar"), "Root")
+            .unwrap()
+            .unwrap();
+        let ch1 = &root.children[0];
+        let review = &ch1.children[0];
+
+        assert_eq!(ch1.metadata.get_str("owner").unwrap().as_deref(), Some("parent"));
+        assert_eq!(review.metadata.get_str("owner").unwrap().as_deref(), Some("child"));
+        assert!(root.all_findings().is_empty(), "{:?}", root.all_findings());
+    }
+
+    /// §5: a parallel node's directory is decided by its children's edges, not by its
+    /// having children at all — that is what lets a readable `ch1.md` spine sit beside
+    /// a `ch1/` of sections while a dot child needs no directory to exist.
+    #[test]
+    fn a_parallel_node_gets_a_directory_only_for_its_slash_children() {
+        let fs = round_trip(&[
+            ("foo/ch1.md", "chapter"),
+            ("foo/ch1/010-intro.md", "section"),
+            ("foo/ch1.review.md", "review"),
+        ]);
+        assert!(exists(&fs, "bar/ch1.md"), "the spine file");
+        assert!(exists(&fs, "bar/ch1/010-intro.md"), "the slash child, inside it");
+        assert!(exists(&fs, "bar/ch1.review.md"), "the dot child, beside it");
+
+        let fs = round_trip(&[("foo/ch1.md", "chapter"), ("foo/ch1.review.md", "review")]);
+        assert!(
+            !fs.is_dir(&PathBuf::from("bar/ch1")),
+            "nothing lives inside ch1, so no directory is made for it"
+        );
+    }
+
+    /// C7 / §4.3: writing does not normalise. A node whose content and sidecar sit in
+    /// different layouts is written back to both of those places, not gathered into the
+    /// one its type intends.
+    #[test]
+    fn a_mixed_node_writes_back_where_its_files_already_were() {
+        let fs = round_trip(&[("foo/ch1.md", "body"), ("foo/ch1/meta.toml", "k = 1")]);
+
+        assert_eq!(read(&fs, "bar/ch1.md"), "body");
+        assert!(read(&fs, "bar/ch1/meta.toml").contains("k = 1"));
+        assert!(!exists(&fs, "bar/ch1.meta.toml"), "the intended sidecar is not created");
+        assert!(!exists(&fs, "bar/ch1/content.md"), "the content is not moved");
+    }
+
+    /// D2: metadata split across two sources round-trips as two sources. The writer
+    /// previously emitted one, so the other was silently dropped on save.
+    #[test]
+    fn a_node_with_a_header_and_a_sidecar_writes_both() {
+        let fs = round_trip(&[
+            ("foo/ch1.md", "```toml\nowner = \"header\"\n```\nbody"),
+            ("foo/ch1.meta.toml", "n = 1"),
+        ]);
+
+        let ch1 = loader()
+            .try_load_root(&fs, &PathBuf::from("bar"), "Root")
+            .unwrap()
+            .unwrap()
+            .children
+            .remove(0);
+
+        assert_eq!(ch1.metadata.location_of("owner"), Some(MetaLocation::InHeader));
+        assert_eq!(ch1.metadata.location_of("n"), Some(MetaLocation::ParallelSidecar));
+    }
+
+    /// D3: a file the library could not parse is written back byte for byte. A save
+    /// must never be the thing that destroys the text a human still has to repair.
+    #[test]
+    fn a_malformed_sidecar_is_written_back_verbatim() {
+        let broken = "owner = \"parent\"\nthis = = not toml\n";
+        let fs = round_trip(&[("foo/ch1.md", "body"), ("foo/ch1.meta.toml", broken)]);
+
+        assert_eq!(read(&fs, "bar/ch1.meta.toml"), broken);
     }
 }
