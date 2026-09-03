@@ -287,6 +287,13 @@ impl FindingPolicy {
         Self::uniform(Severity::Error)
     }
 
+    /// Every kind is recorded, and nothing fails. For reporting drift rather than
+    /// enforcing against it — which is what [`crate::live_entity::LiveEntity::issues`]
+    /// does.
+    pub fn tolerant() -> Self {
+        Self::uniform(Severity::Warn)
+    }
+
     /// Nothing is recorded. For consumers that only want the data.
     pub fn silent() -> Self {
         Self::uniform(Severity::Ignore)
@@ -423,6 +430,8 @@ mod tests {
         for id in FindingKindId::ALL {
             assert_eq!(FindingPolicy::strict().severity_of(id), Severity::Error, "{:?}", id);
             assert_eq!(FindingPolicy::silent().severity_of(id), Severity::Ignore, "{:?}", id);
+            // Tolerant records everything and fails on nothing — what a report wants.
+            assert_eq!(FindingPolicy::tolerant().severity_of(id), Severity::Warn, "{:?}", id);
         }
     }
 

@@ -4,8 +4,9 @@ use anyhow::{anyhow, bail, Context};
 use inscenerator_xfs::Xfs;
 
 use crate::discovery;
-use crate::findings::{Finding, FindingKind, FindingPolicy, FindingSink};
-use crate::placement::{self, ContentLocation, Edge, Layout, MetaLocation};
+use crate::findings::{Finding, FindingPolicy, FindingSink};
+use crate::placement::{self, ContentLocation, Layout, MetaLocation};
+use crate::reading;
 
 // (Almost) Everything is an entity.
 //
@@ -365,19 +366,6 @@ pub(crate) mod utils {
         Ok(Some(MetaSource { origin, state, entity: Some(entity.clone()) }))
     }
 
-    pub fn try_load_file_as_metadata(
-        fs: &dyn Xfs,
-        path: &Path,
-    ) -> anyhow::Result<Option<Metadata>> {
-        let content = try_load_file_as_string(fs, path)?;
-        if let Some(c) = content {
-            let value: toml::Value = toml::from_str(&c)?;
-            Ok(Some(Metadata { value }))
-        } else {
-            Ok(None)
-        }
-    }
-
     pub fn split_out_yaml_front_matter(content: &str) -> Option<(String, String)> {
         if !content.starts_with("---") {
             return None;
@@ -636,186 +624,22 @@ impl EntityLoader {
         }
 
         let mut sink = FindingSink::new(self.policy.clone());
-        let at = |kind: FindingKind| Finding { path: entity_path.clone(), kind };
-
-        // ---- Probe. Existence only: which file *wins* cannot be decided until the type
-        // is known, and the type may itself be recorded in one of these files.
-        let directory_exists = fs.is_dir(&stem);
-        let parallel_content =
-            placement::content_path(base_path, entity_path, ContentLocation::Parallel);
-        let inside_content =
-            placement::content_path(base_path, entity_path, ContentLocation::Inside);
-        // The root has no filename to hang a parallel file off, so only `Inside` exists.
-        let has_parallel_content = !is_root && fs.is_file(&parallel_content);
-        let has_inside_content = fs.is_file(&inside_content);
-
-        // ---- Sidecars. Both are read; a file that does not parse is kept rather than
-        // being allowed to abort the load (D3).
-        let mut meta_sources = Vec::new();
-        if !is_root {
-            let path =
-                placement::sidecar_path(base_path, entity_path, MetaLocation::ParallelSidecar)
-                    .expect("a sidecar location always has a path");
-            if let Some(source) =
-                utils::try_load_sidecar(fs, &path, MetaOrigin::ParallelSidecar, entity_path)?
-            {
-                meta_sources.push(source);
-            }
-        }
-        {
-            let path = placement::sidecar_path(base_path, entity_path, MetaLocation::InsideSidecar)
-                .expect("a sidecar location always has a path");
-            if let Some(source) =
-                utils::try_load_sidecar(fs, &path, MetaOrigin::InsideSidecar, entity_path)?
-            {
-                meta_sources.push(source);
-            }
-        }
-
-        // ---- Type, then layout, then the content choice.
-        //
-        // Choosing between two content files needs the intended layout, which needs the
-        // type, which may itself live in the losing file's front matter. Where both files
-        // exist that is genuinely circular, so the type is resolved from the sidecars
-        // alone; where only one exists there is nothing to choose and its header takes
-        // part in typing normally, since it is read before the type is needed.
-        let sidecars_only = EntityMeta::of(meta_sources.clone());
-        let forced_content = match (has_parallel_content, has_inside_content) {
-            (true, false) => Some((ContentLocation::Parallel, &parallel_content)),
-            (false, true) => Some((ContentLocation::Inside, &inside_content)),
-            _ => None,
-        };
-        let early_header = match forced_content {
-            Some((_, path)) => utils::try_load_file_as_string(fs, path)?
-                .and_then(|c| utils::parse_header_source(&c, entity_path))
-                .map(|(source, _)| source),
-            None => None,
-        };
-        let typing_meta = match &early_header {
-            Some(h) => {
-                let mut v = meta_sources.clone();
-                v.push(h.clone());
-                EntityMeta::of(v)
-            }
-            None => sidecars_only,
-        };
-
-        let actual_type = self.resolve_type(entity_path, entity_type, &typing_meta, &mut sink)?;
-        let ctype = self.schema.compiled(&actual_type)?;
-
-        let layout = if is_root {
-            if ctype.desc.layout == Some(Layout::Parallel) {
-                bail!(
-                    "Root type '{}' declares layout = \"parallel\", but the root is always \
-                     inside: it has no parent filename to sit beside",
-                    actual_type
-                );
-            }
-            if let Some(r) = ctype.rules.iter().find(|r| r.rule.edge == Edge::Dot) {
-                bail!(
-                    "Root type '{}' declares edge = \"dot\" for '{}', but the root has no \
-                     dot children: there is no filename to prefix",
-                    actual_type,
-                    r.rule.name_regex
-                );
-            }
-            Layout::Inside
-        } else {
-            ctype.desc.layout.unwrap_or(inherited_layout)
-        };
-        let intended_content = layout.content_location();
-
-        // ---- Read the content, now that intent can pick.
-        let chosen = match (has_parallel_content, has_inside_content) {
-            (false, false) => None,
-            (true, true) => {
-                // §4.4: intent picks, and the file that lost is reported. Neither is
-                // deleted; both were previously a hard error.
-                let (keep, lost, lost_path) = match intended_content {
-                    ContentLocation::Parallel => {
-                        (ContentLocation::Parallel, ContentLocation::Inside, &inside_content)
-                    }
-                    ContentLocation::Inside => {
-                        (ContentLocation::Inside, ContentLocation::Parallel, &parallel_content)
-                    }
-                };
-                sink.report(at(FindingKind::StrayContent {
-                    path: lost_path.clone(),
-                    location: lost,
-                }))?;
-                Some(keep)
-            }
-            (true, false) => Some(ContentLocation::Parallel),
-            (false, true) => Some(ContentLocation::Inside),
-        };
-        if let Some(actual) = chosen {
-            if actual != intended_content {
-                sink.report(at(FindingKind::ContentLocationNonconformance {
-                    actual,
-                    intended: intended_content,
-                }))?;
-            }
-        }
-
-        let (content, header_source) = match chosen {
-            None => (EntityContent::None, None),
-            Some(loc) => {
-                let path = match loc {
-                    ContentLocation::Parallel => &parallel_content,
-                    ContentLocation::Inside => &inside_content,
-                };
-                let raw = utils::try_load_file_as_string(fs, path)?.unwrap_or_default();
-                let (source, body) = match utils::parse_header_source(&raw, entity_path) {
-                    Some((source, body)) => (Some(source), body),
-                    None => (None, raw),
-                };
-                let content = match loc {
-                    ContentLocation::Parallel => EntityContent::Parallel(body),
-                    ContentLocation::Inside => EntityContent::Inside(body),
-                };
-                (content, source)
-            }
-        };
-        if let Some(h) = header_source {
-            meta_sources.push(h);
-        }
-        let metadata = EntityMeta::of(meta_sources);
-
-        // ---- Report what the metadata turned out to be.
-        for source in metadata.malformed() {
-            sink.report(at(FindingKind::MalformedMetadata {
-                location: source.location(),
-                path: placement::sidecar_path(base_path, entity_path, source.location()),
-                error: source.error().unwrap_or("unknown error").to_string(),
-            }))?;
-        }
-        for conflict in metadata.conflicts() {
-            sink.report(at(FindingKind::MetadataKeyConflict {
-                key: conflict.key,
-                locations: conflict.locations,
-            }))?;
-        }
-        if metadata.sources().len() > 1 {
-            sink.report(at(FindingKind::SplitMetadata {
-                keys_by_location: metadata.keys_by_location(),
-            }))?;
-        }
-        for source in metadata.sources() {
-            // In-header metadata is orthogonal to layout (D2), so it is never misplaced.
-            let actual = source.location();
-            if actual != MetaLocation::InHeader && actual != layout.sidecar_location() {
-                sink.report(at(FindingKind::MetadataLocationNonconformance {
-                    actual,
-                    intended: layout.sidecar_location(),
-                }))?;
-            }
-        }
+        let node = reading::read_node(
+            fs,
+            &self.schema,
+            base_path,
+            entity_path,
+            entity_type,
+            inherited_layout,
+            &mut sink,
+        )?;
+        let ctype = self.schema.compiled(&node.actual_type)?;
 
         // ---- Children, through the one resolver both readers share.
         let resolved = discovery::resolve_children(fs, base_path, entity_path, ctype, &mut sink)?;
 
         // §6: a node with nothing at all behind it is not a node.
-        if content.is_none() && metadata.is_none() && resolved.is_empty() && !directory_exists {
+        if node.is_absent() && resolved.is_empty() {
             return Ok(None);
         }
 
@@ -825,7 +649,7 @@ impl EntityLoader {
             // its own metadata says.
             let child_type = child.node_type.as_deref().unwrap_or("Auto");
             let loaded = self
-                .try_load_entity(fs, base_path, &child.path, child_type, layout)
+                .try_load_entity(fs, base_path, &child.path, child_type, node.layout)
                 .with_context(|| {
                     format!(
                         "error loading child entity '{}' of type '{}' for parent entity '{:?}'",
@@ -843,63 +667,15 @@ impl EntityLoader {
 
         Ok(Some(Entity {
             path: entity_path.clone(),
-            node_type: actual_type,
-            content,
-            metadata,
+            node_type: node.actual_type,
+            content: node.content,
+            metadata: node.metadata,
             children,
-            layout,
+            layout: node.layout,
             findings: sink.into_findings(),
         }))
     }
 
-    /// The type this node actually is: what its metadata claims, checked against what the
-    /// parent's rule assigned. §7.1.
-    ///
-    /// A disagreement is a [`FindingKind::TypeMismatch`], which the default policy rates
-    /// `Error` — so the existing refusal is preserved, but a caller can downgrade it.
-    fn resolve_type(
-        &self,
-        entity_path: &EntityPath,
-        entity_type: &str,
-        metadata: &EntityMeta,
-        sink: &mut FindingSink,
-    ) -> anyhow::Result<String> {
-        // A malformed source is already reported on its own; falling back here keeps a
-        // load that D3 says must survive from failing on the type lookup instead.
-        let declared = match metadata.merged() {
-            Ok(Some(m)) => m.get_str("type")?,
-            Ok(None) | Err(_) => None,
-        };
-
-        if entity_type != "Auto" {
-            if let Some(found) = declared {
-                if found != entity_type {
-                    sink.report(Finding {
-                        path: entity_path.clone(),
-                        kind: FindingKind::TypeMismatch {
-                            expected: entity_type.to_string(),
-                            found,
-                        },
-                    })?;
-                }
-            }
-            return Ok(entity_type.to_string());
-        }
-
-        let found = declared.ok_or_else(|| {
-            anyhow!(
-                "Entity at '{:?}' has Auto type but its metadata is missing the 'type' key",
-                entity_path.local_path()
-            )
-        })?;
-        if found == "Auto" {
-            bail!(
-                "Entity at '{:?}' has metadata 'type' set to 'Auto', which is not allowed",
-                entity_path.local_path()
-            );
-        }
-        Ok(found)
-    }
 }
 
 impl Default for EntityLoader {
@@ -1026,6 +802,15 @@ impl EntityContent {
 
     pub fn inside<S: Into<String>>(s: S) -> EntityContent {
         EntityContent::Inside(s.into())
+    }
+}
+
+/// Compares content to a string by its *text*. Which file the text lives in is
+/// placement, not content, and is asserted separately where it matters.
+/// [`EntityContent::None`] equals no string at all, not even the empty one.
+impl PartialEq<&str> for EntityContent {
+    fn eq(&self, other: &&str) -> bool {
+        self.content() == Some(*other)
     }
 }
 
@@ -1647,7 +1432,7 @@ mod meta_tests {
 mod entity_tests {
 
     use inscenerator_xfs::mockfs;
-    use crate::findings::{FindingKindId, Severity};
+    use crate::findings::{FindingKind, FindingKindId, Severity};
     use crate::placement::Edge;
     use crate::schema::ChildEntityRules;
 

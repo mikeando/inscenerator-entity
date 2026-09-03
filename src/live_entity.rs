@@ -2,17 +2,19 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::fmt;
 
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use inscenerator_xfs::Xfs;
 
 use std::io::Write;
 
 use crate::entity::{
-    utils, EntityContent, EntityMeta, EntityPath, EntityPathEntry, Metadata, MetaOrigin,
-    MetaSource, MetaState,
+    utils, EntityContent, EntityMeta, EntityPath, EntityPathEntry, MetaOrigin, Metadata,
 };
-use crate::placement::MetaLocation;
-use crate::schema::{ChildMatch, Schema};
+use crate::discovery;
+use crate::findings::{Finding, FindingKindId, FindingPolicy, FindingSink};
+use crate::placement::{self, ContentLocation, Layout, MetaLocation};
+use crate::reading;
+use crate::schema::Schema;
 
 /// Shared context for a tree of LiveEntities.
 pub struct LiveEntityRoot {
@@ -22,6 +24,8 @@ pub struct LiveEntityRoot {
     pub base_path: PathBuf,
     /// The schema defining entity types and rules.
     pub schema: Arc<Schema>,
+    /// How severely each kind of drift is treated. Tolerant by default (D6).
+    pub policy: FindingPolicy,
 }
 
 impl fmt::Debug for LiveEntityRoot {
@@ -41,6 +45,46 @@ pub struct LiveEntity {
     pub path: EntityPath,
     /// Type name of the entity.
     pub node_type: String,
+    /// The layout of the parent *instance* this handle was reached through, used when
+    /// this node's own type declares none (§2.1). `Inside` for the root, and for a
+    /// handle built directly by address, which has no parent to inherit from.
+    ///
+    /// Static — derived from schema and ancestry, never from disk — so unlike a snapshot
+    /// of what is on disk it cannot go stale.
+    pub inherited_layout: Layout,
+}
+
+/// Findings about the node's own identity. Every accessor needs the type resolved, so
+/// every accessor answers for a type that disagrees with the schema.
+const TYPE_FINDINGS: &[FindingKindId] = &[FindingKindId::TypeMismatch];
+
+/// Findings [`LiveEntity::content`] answers for: which of the two content files won, and
+/// whether it is where the layout intends.
+const CONTENT_FINDINGS: &[FindingKindId] = &[
+    FindingKindId::TypeMismatch,
+    FindingKindId::StrayContent,
+    FindingKindId::ContentLocationNonconformance,
+];
+
+/// Findings [`LiveEntity::metadata`] answers for: everything about the sources it returns.
+const METADATA_FINDINGS: &[FindingKindId] = &[
+    FindingKindId::TypeMismatch,
+    FindingKindId::MalformedMetadata,
+    FindingKindId::MetadataKeyConflict,
+    FindingKindId::SplitMetadata,
+    FindingKindId::MetadataLocationNonconformance,
+];
+
+/// What a node has actually established on disk. §4.1.
+///
+/// Used for deciding where a *write* should land; nothing in the read semantics of an
+/// entity depends on it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservedPlacement {
+    /// `None` when no content file exists, in which case intent decides.
+    pub content: Option<ContentLocation>,
+    /// The metadata sources present, in `MetaLocation` order. Empty means none.
+    pub metadata: Vec<MetaLocation>,
 }
 
 /// Controls where content is written relative to the entity's disk path.
@@ -65,6 +109,8 @@ pub struct ChildBuilder {
     /// Node type of the parent (may be "Auto", resolved via actual_type() at build time).
     parent_node_type: String,
     entry: EntityPathEntry,
+    /// The layout of the parent instance, passed to the child it builds (§2.1).
+    parent_inherited_layout: Layout,
     node_type_override: Option<String>,
     content_text: Option<String>,
     content_layout: ChildContentLayout,
@@ -155,6 +201,7 @@ impl ChildBuilder {
         let inner = ChildBuilder {
             root: self.root.clone(),
             parent_path: own_path,
+            parent_inherited_layout: self.parent_inherited_layout,
             parent_node_type: String::new(), // intentionally unused: nested builders
                                              // always enter via build_internal(parent_type),
                                              // never via build() which reads this field
@@ -183,6 +230,7 @@ impl ChildBuilder {
             root: self.root.clone(),
             path: self.parent_path.clone(),
             node_type: self.parent_node_type.clone(),
+            inherited_layout: self.parent_inherited_layout,
         };
         let parent_type = parent_live.actual_type()?;
         self.build_internal(&parent_type)
@@ -360,14 +408,15 @@ impl ChildBuilder {
         };
 
         // Compute the content path (needed for both plain content write and InHeader)
-        let content_path = match self.content_layout {
-            ChildContentLayout::Inside => own_disk_path.join("content.md"),
-            ChildContentLayout::Parallel => own_disk_path.with_added_extension("md"),
+        let content_layout_used = match self.content_layout {
+            ChildContentLayout::Inside => ContentLocation::Inside,
+            ChildContentLayout::Parallel => ContentLocation::Parallel,
             ChildContentLayout::Inferred => match &self.entry {
-                EntityPathEntry::Slash(_) => own_disk_path.join("content.md"),
-                EntityPathEntry::Dot(_) => own_disk_path.with_added_extension("md"),
+                EntityPathEntry::Slash(_) => ContentLocation::Inside,
+                EntityPathEntry::Dot(_) => ContentLocation::Parallel,
             },
         };
+        let content_path = placement::content_path(&self.root.base_path, &own_path, content_layout_used);
 
         // --- Content write ---
         // Skip plain content write when InHeader is used (written together with header below)
@@ -426,7 +475,14 @@ impl ChildBuilder {
         Ok(LiveEntity {
             root: self.root,
             path: own_path,
+            // TODO(Task 10): the child's layout is resolved from its type and the parent
+            // instance, not guessed from its edge. Until then this mirrors the layout the
+            // write above used, so a handle reads back what the builder just wrote.
             node_type: return_node_type,
+            inherited_layout: match content_layout_used {
+                ContentLocation::Inside => Layout::Inside,
+                ContentLocation::Parallel => Layout::Parallel,
+            },
         })
     }
 }
@@ -445,10 +501,27 @@ impl LiveEntity {
                 fs,
                 base_path,
                 schema,
+                policy: FindingPolicy::default(),
             }),
             path,
             node_type,
+            inherited_layout: Layout::Inside,
         }
+    }
+
+    /// Sets the drift policy for this handle and every handle reached through it.
+    ///
+    /// Call it before descending: handles already obtained keep the policy they were
+    /// built with.
+    #[must_use]
+    pub fn with_policy(self, policy: FindingPolicy) -> Self {
+        let root = Arc::new(LiveEntityRoot {
+            fs: self.root.fs.clone(),
+            base_path: self.root.base_path.clone(),
+            schema: self.root.schema.clone(),
+            policy,
+        });
+        Self { root, ..self }
     }
 
     /// Loads a schema from 'schema.toml' in the given directory and returns a root LiveEntity.
@@ -478,39 +551,92 @@ impl LiveEntity {
         &self.node_type
     }
 
-    /// Returns the actual type name of this entity, resolving "Auto" if necessary.
+    /// Returns the actual type name of this entity, resolving "Auto" from its metadata.
     ///
     /// # Errors
     ///
-    /// Returns an error if resolution fails or if metadata is missing/invalid for Auto type.
+    /// Returns an error if the node cannot be read, or if it is `Auto` and its metadata
+    /// records no type.
     pub fn actual_type(&self) -> anyhow::Result<String> {
         if self.node_type != "Auto" {
             return Ok(self.node_type.clone());
         }
+        Ok(self.read(TYPE_FINDINGS)?.actual_type)
+    }
 
-        let meta = self.metadata()?;
-        let m = meta.merged()?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Entity at {:?} has Auto type but no metadata",
-                self.on_disk_path()
-            )
-        })?;
+    /// A sink carrying this tree's policy.
+    fn sink(&self) -> FindingSink {
+        FindingSink::new(self.root.policy.clone())
+    }
 
-        let t = m.get_str("type")?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Entity at {:?} has Auto type but metadata is missing 'type' key",
-                self.on_disk_path()
-            )
-        })?;
+    /// Reads this node through the reader the eager loader also uses, so a handle and a
+    /// loaded tree can never disagree about what is here (C2).
+    fn read_into(&self, sink: &mut FindingSink) -> anyhow::Result<reading::NodeRead> {
+        let fs = self.root.fs.lock().unwrap();
+        reading::read_node(
+            &*fs,
+            &self.root.schema,
+            &self.root.base_path,
+            &self.path,
+            &self.node_type,
+            self.inherited_layout,
+            sink,
+        )
+    }
 
-        if t == "Auto" {
-            bail!(
-                "Entity at {:?} has metadata 'type' set to 'Auto', which is not allowed",
-                self.on_disk_path()
-            );
+    /// Reads this node, raising only the findings the calling accessor answers for.
+    ///
+    /// A handle reads the whole node whatever you ask it — typing needs the metadata,
+    /// which may itself live in the content file — but a lazy reader must abort only the
+    /// accessor that produced the finding (D6). Asking for the children of a node whose
+    /// sidecar is unparseable is a fair question, and gets an answer.
+    fn read(&self, owned: &[FindingKindId]) -> anyhow::Result<reading::NodeRead> {
+        let mut collected = FindingSink::new(FindingPolicy::tolerant());
+        let node = self.read_into(&mut collected)?;
+
+        let mut sink = self.sink();
+        for finding in collected.into_findings() {
+            if owned.contains(&finding.kind.id()) {
+                sink.report(finding)?;
+            }
         }
+        Ok(node)
+    }
 
-        Ok(t)
+    /// The layout this node's type intends, falling back to the layout of the parent
+    /// instance it was reached through (§2.1). Always `Inside` for the root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node cannot be read or its type is not in the schema.
+    pub fn intended_layout(&self) -> anyhow::Result<Layout> {
+        Ok(self.read(TYPE_FINDINGS)?.layout)
+    }
+
+    /// What this node has established on disk, for deciding where a write should land.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node cannot be read.
+    pub fn observed(&self) -> anyhow::Result<ObservedPlacement> {
+        let node = self.read(TYPE_FINDINGS)?;
+        let content = match node.content {
+            EntityContent::Parallel(_) => Some(ContentLocation::Parallel),
+            EntityContent::Inside(_) => Some(ContentLocation::Inside),
+            EntityContent::None => None,
+        };
+        Ok(ObservedPlacement { content, metadata: node.metadata.locations() })
+    }
+
+    /// Everything §9.1 has to say about *this* node, probed from disk at call time.
+    ///
+    /// Never fails because of a finding, whatever the policy says — reporting is this
+    /// method's whole job. It errors only when the node cannot be read at all.
+    pub fn issues(&self) -> anyhow::Result<Vec<Finding>> {
+        let mut sink = FindingSink::new(FindingPolicy::tolerant());
+        let node = self.read_into(&mut sink)?;
+        self.child_handles(&node, &mut sink)?;
+        Ok(sink.into_findings())
     }
 
     /// Returns the full disk path for this entity's directory (or sibling base for Dot entries).
@@ -520,190 +646,104 @@ impl LiveEntity {
 
     /// Parallel content path: `name.md` (lives alongside the entity, not inside it).
     fn dot_content_path(&self) -> PathBuf {
-        self.on_disk_path().with_added_extension("md")
+        placement::content_path(&self.root.base_path, &self.path, ContentLocation::Parallel)
     }
 
     /// Inside content path: `dir/content.md`.
     fn slash_content_path(&self) -> PathBuf {
-        self.on_disk_path().join("content.md")
+        placement::content_path(&self.root.base_path, &self.path, ContentLocation::Inside)
     }
 
-    /// Parallel metadata path: `name.meta.toml`.
+    /// Parallel metadata path: `name.meta.toml` — the suffix is *appended* to the stem.
+    /// Substituting it resolved a dot child onto its parent's sidecar (C1).
     fn dot_metadata_path(&self) -> PathBuf {
-        self.on_disk_path().with_extension("meta.toml")
+        placement::sidecar_path(&self.root.base_path, &self.path, MetaLocation::ParallelSidecar)
+            .expect("a sidecar location always has a path")
     }
 
     /// Inside metadata path: `dir/meta.toml`.
     fn slash_metadata_path(&self) -> PathBuf {
-        self.on_disk_path().join("meta.toml")
+        placement::sidecar_path(&self.root.base_path, &self.path, MetaLocation::InsideSidecar)
+            .expect("a sidecar location always has a path")
     }
 
-    /// Reads raw content from disk, auto-detecting Parallel vs Inside layout.
+    /// The content file this node reads from: `(raw_text, is_parallel, path)`.
     ///
-    /// Returns `(raw_text, is_parallel, path_used)`. Returns an error if both
-    /// Parallel and Inside content files exist simultaneously.
+    /// Where both content files exist the intended layout picks one and the other is
+    /// reported (§4.4); where neither exists the path is where intent says a write would
+    /// go, so a caller creating content has somewhere to put it.
     fn get_content_info(&self) -> anyhow::Result<(Option<String>, bool, PathBuf)> {
+        let node = self.read(CONTENT_FINDINGS)?;
+        let location = match node.content {
+            EntityContent::Parallel(_) => ContentLocation::Parallel,
+            EntityContent::Inside(_) => ContentLocation::Inside,
+            EntityContent::None => node.layout.content_location(),
+        };
+        let path = placement::content_path(&self.root.base_path, &self.path, location);
         let fs = self.root.fs.lock().unwrap();
-        let is_root = self.path.entries.is_empty();
-
-        let dot_content_file = self.dot_content_path();
-        let slash_content_file = self.slash_content_path();
-
-        if is_root {
-            let content = utils::try_load_file_as_string(&*fs, &slash_content_file)?;
-            return Ok((content, false, slash_content_file));
-        }
-
-        if let Some(c) = utils::try_load_file_as_string(&*fs, &dot_content_file)? {
-            if fs.is_file(&slash_content_file) {
-                bail!(
-                    "Both {} and {} exist.",
-                    dot_content_file.display(),
-                    slash_content_file.display()
-                );
-            }
-            return Ok((Some(c), true, dot_content_file));
-        }
-
-        let content = utils::try_load_file_as_string(&*fs, &slash_content_file)?;
-        Ok((content, false, slash_content_file))
+        let raw = utils::try_load_file_as_string(&*fs, &path)?;
+        Ok((raw, location == ContentLocation::Parallel, path))
     }
 
     /// Reads the content of the entity from disk.
     ///
     /// # Errors
     ///
-    /// Returns an error if disk access fails or if storage format is inconsistent.
+    /// Returns an error if disk access fails, or on a finding the policy rates `Error`.
     pub fn content(&self) -> anyhow::Result<EntityContent> {
-        let (content_str, is_parallel, _) = self.get_content_info()?;
-
-        let content = if let Some(c) = content_str {
-            let (_, a) = utils::parse_header(&c)
-                .map(|(m, s, a, h)| (Some((m, s, h)), a))
-                .unwrap_or((None, c));
-            if is_parallel {
-                EntityContent::Parallel(a)
-            } else {
-                EntityContent::Inside(a)
-            }
-        } else {
-            EntityContent::None
-        };
-
-        Ok(content)
+        Ok(self.read(CONTENT_FINDINGS)?.content)
     }
 
-    /// Reads the metadata of the entity from disk.
+    /// Reads the metadata of the entity from disk, as the set of sources it has.
+    ///
+    /// Several sources merge per key (D2). A source that did not parse is kept rather
+    /// than dropped, so it can be inspected and repaired (D3).
     ///
     /// # Errors
     ///
-    /// Returns an error if disk access fails or if multiple metadata sources are found.
+    /// Returns an error if disk access fails, or on a finding the policy rates `Error`.
     pub fn metadata(&self) -> anyhow::Result<EntityMeta> {
-        let is_root = self.path.entries.is_empty();
-
-        // Read content info first (acquires and releases lock internally).
-        let (content_str, _, _) = self.get_content_info()?;
-
-        let metadata_from_content = content_str.and_then(|c| {
-            utils::parse_header(&c).map(|(m, separator, _, header_type)| MetaSource {
-                origin: MetaOrigin::Header { header_type, separator },
-                state: MetaState::Parsed(m),
-                entity: Some(self.path.clone()),
-            })
-        });
-
-        // 2. Try loading from meta.toml files
-        let dot_metadata_file = self.dot_metadata_path();
-        let slash_metadata_file = self.slash_metadata_path();
-
-        let fs = self.root.fs.lock().unwrap();
-        let dot_metadata = if !is_root {
-            utils::try_load_file_as_metadata(&*fs, &dot_metadata_file)?
-        } else {
-            None
-        };
-        let slash_metadata = utils::try_load_file_as_metadata(&*fs, &slash_metadata_file)?;
-        drop(fs);
-
-        let mut meta_sources = Vec::new();
-        if let Some(m) = dot_metadata {
-            meta_sources.push(MetaSource {
-                origin: MetaOrigin::ParallelSidecar,
-                state: MetaState::Parsed(m),
-                entity: Some(self.path.clone()),
-            });
-        }
-        if let Some(m) = slash_metadata {
-            meta_sources.push(MetaSource {
-                origin: MetaOrigin::InsideSidecar,
-                state: MetaState::Parsed(m),
-                entity: Some(self.path.clone()),
-            });
-        }
-        if let Some(m) = metadata_from_content {
-            meta_sources.push(m);
-        }
-
-        // Several sources merge per key (D2); the ambiguity becomes a finding in Task 8
-        // rather than a refusal here.
-        Ok(EntityMeta::of(meta_sources))
+        Ok(self.read(METADATA_FINDINGS)?.metadata)
     }
 
-    /// Returns handles to the children of this entity as defined by the schema.
+    /// Returns handles to the children of this entity.
+    ///
+    /// A child is identified by *(edge, name)*, so two children may share a name across
+    /// the edges and both are returned. §4.4.
     ///
     /// # Errors
     ///
-    /// Returns an error if disk access fails or if an unexpected child is encountered.
+    /// Returns an error if disk access fails, or on a finding the policy rates `Error` —
+    /// an unexpected child, under `allow_additional = false`, among them.
     pub fn children(&self) -> anyhow::Result<Vec<LiveEntity>> {
-        let is_root = self.path.entries.is_empty();
+        let node = self.read(TYPE_FINDINGS)?;
+        self.child_handles(&node, &mut self.sink())
+    }
 
-        // Collect child paths with the lock held, then release before calling actual_type().
-        let children_paths = {
+    /// Child resolution, through the one resolver the eager loader also uses.
+    fn child_handles(
+        &self,
+        node: &reading::NodeRead,
+        sink: &mut FindingSink,
+    ) -> anyhow::Result<Vec<LiveEntity>> {
+        let ctype = self.root.schema.compiled(&node.actual_type)?;
+
+        let resolved = {
             let fs = self.root.fs.lock().unwrap();
-            let dot_children = if !is_root {
-                utils::find_dot_children(&*fs, &self.root.base_path, &self.path)?
-            } else {
-                vec![]
-            };
-            let slash_children = utils::find_slash_children(&*fs, &self.root.base_path, &self.path)?;
-            dot_children
-                .into_iter()
-                .chain(slash_children)
-                .collect::<Vec<EntityPath>>()
-        }; // lock released here
+            discovery::resolve_children(&*fs, &self.root.base_path, &self.path, ctype, sink)?
+        };
 
-        let actual_type = self.actual_type()?;
-        let entity_type_descriptor = self.root.schema.get_entity_type(&actual_type)?;
-
-        let mut loaded_children = vec![];
-        for child_path in children_paths {
-            let child_name: &str = child_path.last_name().unwrap();
-            if entity_type_descriptor.ignore.iter().any(|s| s == child_name) {
-                continue;
-            }
-            let mut found_match = false;
-            for child_rule in &entity_type_descriptor.children {
-                let re = regex::Regex::new(&child_rule.name_regex).unwrap();
-                if re.is_match(child_name) {
-                    loaded_children.push(LiveEntity {
-                        root: self.root.clone(),
-                        path: child_path.clone(),
-                        node_type: child_rule.node_type.clone(),
-                    });
-                    found_match = true;
-                    break;
-                }
-            }
-            if !found_match && !entity_type_descriptor.allow_additional {
-                bail!(
-                    "Unexpected child entity '{}' in entity '{:?}'",
-                    child_name,
-                    self.on_disk_path()
-                );
-            }
-        }
-
-        Ok(loaded_children)
+        Ok(resolved
+            .into_iter()
+            .map(|child| LiveEntity {
+                root: self.root.clone(),
+                path: child.path,
+                // §7.2: a child that matched no rule has no declared type, so its own
+                // metadata has to say what it is.
+                node_type: child.node_type.unwrap_or_else(|| "Auto".to_string()),
+                inherited_layout: node.layout,
+            })
+            .collect())
     }
 
     /// Updates the content of the entity on disk.
@@ -1002,6 +1042,7 @@ impl LiveEntity {
             parent_path: self.path.clone(),
             parent_node_type: self.node_type.clone(),
             entry,
+            parent_inherited_layout: self.inherited_layout,
             node_type_override: None,
             content_text: None,
             content_layout: ChildContentLayout::Inferred,
@@ -1010,51 +1051,40 @@ impl LiveEntity {
         }
     }
     
+    /// Returns the child with this name.
+    ///
+    /// Resolution runs through [`Self::children`], which is what guarantees the two can
+    /// never disagree about what exists (C2).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is no such child, or if two children share the name
+    /// across the edges — they are different entities, and the name alone does not say
+    /// which one is meant.
     pub fn child(&self, name: &str) -> anyhow::Result<LiveEntity> {
-        
-        let slash_path = self.path.extend_slash(name);
-        let slash_child_exists = self.root.fs.lock().unwrap().is_dir(&slash_path.to_pathbuf(&self.root.base_path));
-        
-        
-        let dot_path = self.path.extend_dot(name);
-        // TODO: It is possible that a dot child exists with neither content or metadata file.
-        let dot_content_path = dot_path.to_pathbuf(&self.root.base_path).with_added_extension("md");
-        let dot_metadata_path = dot_path.to_pathbuf(&self.root.base_path).with_added_extension("meta.toml");
-        let dot_child_exists = self.root.fs.lock().unwrap().is_file(&dot_content_path)
-            || self.root.fs.lock().unwrap().is_file(&dot_metadata_path);
+        let mut matched: Vec<LiveEntity> = self
+            .children()?
+            .into_iter()
+            .filter(|c| c.path.last_name() == Some(name))
+            .collect();
 
-        let actual_type = self.actual_type()?;
-        let compiled = self.root.schema.compiled(&actual_type)?;
-        // TODO(Task 8): resolve through discovery::resolve_children so that child() and
-        // children() cannot disagree (C2). This preserves today's behaviour meanwhile.
-        let node_type = || match compiled.match_child(name) {
-            ChildMatch::Matched(r) => Ok(r.rule.node_type.clone()),
-            _ => Err(anyhow!("No matching child rule found for {}", name)),
-        };
-
-        match (slash_child_exists, dot_child_exists) {
-            (true, true) => bail!("Both Slash and Dot child exist with name '{}'", name),
-            (true, false) => {
-                let child_path = slash_path;
-                let node_type = node_type()?;
-                Ok(LiveEntity {
-                    root: self.root.clone(),
-                    path: child_path.clone(),
-                    node_type,
-                    })
-            },
-            (false, true) => {
-                let child_path = dot_path;
-                let node_type = node_type()?;
-
-                Ok(LiveEntity {
-                    root: self.root.clone(),
-                    path: child_path.clone(),
-                    node_type
-                })
+        match matched.len() {
+            0 => bail!("No child found with name '{}'", name),
+            1 => Ok(matched.remove(0)),
+            _ => {
+                let names: Vec<String> = matched
+                    .iter()
+                    .map(|c| format!("'{}'", c.path.local_path().display()))
+                    .collect();
+                bail!(
+                    "Two entities here are named '{}': {}. They are different entities \
+                     that happen to share a name, so rename one of them or ask for the \
+                     one you want by its own path.",
+                    name,
+                    names.join(" and ")
+                )
             }
-            (false, false) => bail!("No child found with name '{}'", name),
-        }   
+        }
     }
 }
 
@@ -1190,25 +1220,6 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(live.children().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn test_conflict_detection() {
-        let mut fs = mockfs::MockFS::new();
-        create_file_with_content(&mut fs, "foo/entity1", "content.md", "Inside");
-        create_file_with_content(&mut fs, "foo", "entity1.md", "Parallel");
-        let fs = Arc::new(Mutex::new(fs));
-        let schema = setup_schema();
-
-        let live = LiveEntity::new(
-            fs.clone(),
-            PathBuf::from("foo"),
-            EntityPath::empty().extend_slash("entity1"),
-            "Type".to_string(),
-            schema,
-        );
-
-        assert!(live.content().is_err());
     }
 
     #[test]
@@ -1506,6 +1517,15 @@ mod tests {
         let mut schema = Schema::new();
         schema.add_entity_type(EntityTypeDescription {
             name: "Parent".to_string(),
+            children: vec![],
+            allow_additional: true,
+            layout: None,
+            ignore: vec![],
+        }).unwrap();
+        // The written type still has to be one the schema declares — reading the child
+        // back resolves its layout, and an undeclared type has none.
+        schema.add_entity_type(EntityTypeDescription {
+            name: "Chapter".to_string(),
             children: vec![],
             allow_additional: true,
             layout: None,
@@ -2123,5 +2143,211 @@ mod tests {
         let live = LiveEntity::new(fs, PathBuf::from("project"), EntityPath::empty(), "Project".to_string(), schema);
         let children = live.children().unwrap();
         assert_eq!(children.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod live_read_tests {
+    use super::*;
+    use crate::findings::{FindingKind, FindingPolicy};
+    use crate::placement::{ContentLocation, Edge, Layout};
+    use inscenerator_xfs::mockfs;
+    use std::sync::{Arc, Mutex};
+
+    /// Root (inside) > Chapter (parallel) > Section. `notes` is declared on the slash
+    /// edge and `review` on the dot edge; Section declares no layout of its own, so it
+    /// takes the layout of the Chapter instance it is reached through.
+    const SCHEMA: &str = r#"
+[Root]
+allow_additional = false
+[[Root.children]]
+name_regex = "^ch"
+node_type = "Chapter"
+
+[Chapter]
+allow_additional = false
+layout = "parallel"
+[[Chapter.children]]
+name_regex = "^notes$"
+node_type = "Section"
+edge = "slash"
+[[Chapter.children]]
+name_regex = "^review$"
+node_type = "Section"
+edge = "dot"
+
+[Section]
+allow_additional = false
+children = []
+"#;
+
+    fn root_with(files: &[(&str, &str)]) -> LiveEntity {
+        let mut fs = mockfs::MockFS::new();
+        fs.create_dir_all(&PathBuf::from("foo")).unwrap();
+        for (path, content) in files {
+            let p = PathBuf::from(path);
+            fs.create_dir_all(p.parent().unwrap()).unwrap();
+            fs.add_r(&p, content.as_bytes().to_vec()).unwrap();
+        }
+        LiveEntity::new(
+            Arc::new(Mutex::new(fs)),
+            PathBuf::from("foo"),
+            EntityPath::empty(),
+            "Root".to_string(),
+            Arc::new(Schema::load_from_str(SCHEMA).unwrap()),
+        )
+    }
+
+    /// The `ch1` handle the tests below hang off. Reached through `child()`, so it
+    /// carries whatever the root handle passes down.
+    fn ch1(files: &[(&str, &str)]) -> LiveEntity {
+        root_with(files).child("ch1").unwrap()
+    }
+
+    /// C2: `child()` and `children()` must never contradict each other about what
+    /// exists. Two children may share a name across the edges — `(edge, name)` is what
+    /// identifies a child — so both are returned, and it is the name-based lookup that
+    /// refuses, rather than one of the two entities being quietly discarded.
+    #[test]
+    fn child_and_children_agree_on_a_duplicated_name() {
+        let ch1 = ch1(&[
+            ("foo/ch1.md", "chapter"),
+            ("foo/ch1/notes.md", "slash"),
+            ("foo/ch1.notes.md", "dot"),
+        ]);
+
+        let paths: Vec<EntityPath> = ch1.children().unwrap().iter().map(|c| c.path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![ch1.path.extend_dot("notes"), ch1.path.extend_slash("notes")]
+        );
+
+        let err = ch1.child("notes").unwrap_err().to_string();
+        assert!(err.contains("ch1.notes"), "the refusal names both files: {}", err);
+        assert!(err.contains("ch1/notes"), "the refusal names both files: {}", err);
+    }
+
+    /// C1 (the third site): a dot child's sidecar is its own stem with `.meta.toml`
+    /// appended. Substituting resolved `ch1.review` onto `ch1.meta.toml`, so a handle
+    /// on the child read — and would later overwrite — its parent's metadata.
+    #[test]
+    fn a_dot_childs_sidecar_is_its_own_not_its_parents() {
+        let ch1 = ch1(&[
+            ("foo/ch1.md", "chapter"),
+            ("foo/ch1.meta.toml", "owner = \"parent\""),
+            ("foo/ch1.review.md", "review"),
+            ("foo/ch1.review.meta.toml", "owner = \"child\""),
+        ]);
+        let review = ch1.child("review").unwrap();
+
+        let owner = |e: &LiveEntity| e.metadata().unwrap().get_str("owner").unwrap();
+        assert_eq!(owner(&ch1).as_deref(), Some("parent"));
+        assert_eq!(owner(&review).as_deref(), Some("child"));
+    }
+
+    /// §4.4: both content files existing is drift, not a refusal. The intended layout
+    /// picks one and the read succeeds; it used to fail outright.
+    #[test]
+    fn both_content_files_read_by_intended_layout_instead_of_failing() {
+        let ch1 = ch1(&[
+            ("foo/ch1.md", "parallel body"),
+            ("foo/ch1/content.md", "inside body"),
+        ]);
+
+        assert_eq!(ch1.content().unwrap(), EntityContent::Parallel("parallel body".into()));
+    }
+
+    /// D2 / §4.5: two sources merge, and each key still knows which source holds it,
+    /// which is what lets a later write land on the file the key already lives in.
+    #[test]
+    fn metadata_merges_a_header_and_a_sidecar() {
+        let ch1 = ch1(&[
+            ("foo/ch1.md", "```toml\nowner = \"header\"\n```\nbody"),
+            ("foo/ch1.meta.toml", "n = 1"),
+        ]);
+        let meta = ch1.metadata().unwrap();
+
+        assert_eq!(meta.get_str("owner").unwrap().as_deref(), Some("header"));
+        assert_eq!(meta.location_of("owner"), Some(MetaLocation::InHeader));
+        assert_eq!(meta.location_of("n"), Some(MetaLocation::ParallelSidecar));
+    }
+
+    /// §2.1: layout is inherited by *instance*, so a Section reached through a Chapter
+    /// is Parallel even though the Section type declares no layout at all.
+    #[test]
+    fn intended_layout_is_inherited_from_the_parent_handle() {
+        let ch1 = ch1(&[("foo/ch1.md", "chapter"), ("foo/ch1/notes.md", "section")]);
+
+        assert_eq!(ch1.intended_layout().unwrap(), Layout::Parallel, "declared");
+        assert_eq!(
+            ch1.child("notes").unwrap().intended_layout().unwrap(),
+            Layout::Parallel,
+            "inherited from the chapter it was reached through"
+        );
+    }
+
+    /// §4.1: what a node has *established* is a different question from what its type
+    /// intends. A mixed node answers differently to each, and the write side needs both.
+    #[test]
+    fn observed_reports_what_is_on_disk_not_what_is_intended() {
+        let ch1 = ch1(&[("foo/ch1.md", "body"), ("foo/ch1/meta.toml", "k = 1")]);
+
+        assert_eq!(ch1.intended_layout().unwrap(), Layout::Parallel);
+        assert_eq!(
+            ch1.observed().unwrap(),
+            ObservedPlacement {
+                content: Some(ContentLocation::Parallel),
+                metadata: vec![MetaLocation::InsideSidecar],
+            }
+        );
+    }
+
+    /// D4 (lazy half): drift is reported when it is asked for, and never by failing an
+    /// unrelated read. Here `review` is declared on the dot edge but sits on the slash
+    /// edge — it is still a child, and the node around it is still readable.
+    #[test]
+    fn issues_reports_drift_without_failing_the_reads() {
+        let ch1 = ch1(&[("foo/ch1.md", "chapter"), ("foo/ch1/review.md", "on the wrong edge")]);
+
+        assert!(ch1.issues().unwrap().iter().any(|f| matches!(
+            f.kind,
+            FindingKind::EdgeNonconformance { actual: Edge::Slash, intended: Edge::Dot, .. }
+        )));
+        assert!(ch1.content().is_ok());
+        assert_eq!(ch1.children().unwrap().len(), 1);
+    }
+
+    /// D6 (lazy half): a handle reads on demand, so an `Error` finding aborts only the
+    /// accessor that met it. The eager loader fails the whole tree instead.
+    #[test]
+    fn an_error_finding_fails_only_the_accessor_that_produced_it() {
+        let ch1 = root_with(&[
+            ("foo/ch1.md", "chapter"),
+            ("foo/ch1.meta.toml", "this = = not toml"),
+            ("foo/ch1/notes.md", "section"),
+        ])
+        .with_policy(FindingPolicy::strict())
+        .child("ch1")
+        .unwrap();
+
+        assert!(ch1.metadata().is_err());
+        assert_eq!(ch1.children().unwrap().len(), 1, "the rest of the node still reads");
+        assert_eq!(ch1.content().unwrap(), "chapter", "the content is still readable");
+    }
+
+    /// D3: a malformed source is never silently dropped. Reading a value *through* it
+    /// refuses — the file may well hold that key — and the refusal names the file to
+    /// repair, while the raw text stays reachable so a caller can repair it.
+    #[test]
+    fn a_malformed_source_is_reachable_but_not_readable_through() {
+        let ch1 = ch1(&[("foo/ch1.md", "chapter"), ("foo/ch1.meta.toml", "this = = not toml")]);
+        let meta = ch1.metadata().unwrap();
+
+        let err = meta.get_str("owner").unwrap_err().to_string();
+        assert!(err.contains("ch1.meta.toml"), "the message names the file: {}", err);
+
+        let bad = meta.malformed();
+        assert_eq!(bad.len(), 1);
+        assert!(bad[0].raw().unwrap().contains("not toml"));
     }
 }
