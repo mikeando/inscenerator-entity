@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context};
 use inscenerator_xfs::Xfs;
 
-use crate::placement::MetaLocation;
+use crate::discovery;
+use crate::findings::{Finding, FindingKind, FindingPolicy, FindingSink};
+use crate::placement::{self, ContentLocation, Edge, Layout, MetaLocation};
 
 // (Almost) Everything is an entity.
 //
@@ -343,6 +345,26 @@ pub(crate) mod utils {
         Ok(Some(content))
     }
 
+    /// Loads a sidecar, keeping a file that exists but does not parse rather than
+    /// failing on it (D3). The raw text and the parse error travel with the source so a
+    /// caller can inspect and repair it, and so a save cannot destroy a file the library
+    /// could not read.
+    pub fn try_load_sidecar(
+        fs: &dyn Xfs,
+        path: &Path,
+        origin: MetaOrigin,
+        entity: &EntityPath,
+    ) -> anyhow::Result<Option<MetaSource>> {
+        let Some(raw) = try_load_file_as_string(fs, path)? else {
+            return Ok(None);
+        };
+        let state = match toml::from_str::<toml::Value>(&raw) {
+            Ok(value) => MetaState::Parsed(Metadata { value }),
+            Err(e) => MetaState::Malformed { raw, error: e.to_string() },
+        };
+        Ok(Some(MetaSource { origin, state, entity: Some(entity.clone()) }))
+    }
+
     pub fn try_load_file_as_metadata(
         fs: &dyn Xfs,
         path: &Path,
@@ -456,6 +478,42 @@ pub(crate) mod utils {
         Some((actual_content, inner_toml_trimmed, separator))
     }
 
+    /// Front matter as a metadata source, plus the body below it.
+    ///
+    /// Returns `None` when there is no front matter at all — that is plain content, not a
+    /// broken header. Delimiters that *are* present but do not parse yield a `Malformed`
+    /// source carrying the enclosed text, rather than being silently dropped (D3).
+    pub fn parse_header_source(
+        content: &str,
+        entity: &EntityPath,
+    ) -> Option<(MetaSource, String)> {
+        if let Some((body, inner_yaml)) = split_out_yaml_front_matter(content) {
+            let state = match yaml_rust::YamlLoader::load_from_str(&inner_yaml) {
+                Ok(docs) if !docs.is_empty() => {
+                    MetaState::Parsed(Metadata { value: yaml_to_toml(&docs[0]) })
+                }
+                Ok(_) => MetaState::Malformed {
+                    raw: inner_yaml,
+                    error: "front matter is empty".to_string(),
+                },
+                Err(e) => MetaState::Malformed { raw: inner_yaml, error: e.to_string() },
+            };
+            let origin = MetaOrigin::Header { header_type: HeaderType::Yaml, separator: None };
+            return Some((MetaSource { origin, state, entity: Some(entity.clone()) }, body));
+        }
+
+        if let Some((body, inner_toml, separator)) = split_out_toml_front_matter(content) {
+            let state = match toml::from_str::<toml::Value>(&inner_toml) {
+                Ok(value) => MetaState::Parsed(Metadata { value }),
+                Err(e) => MetaState::Malformed { raw: inner_toml, error: e.to_string() },
+            };
+            let origin = MetaOrigin::Header { header_type: HeaderType::Toml, separator };
+            return Some((MetaSource { origin, state, entity: Some(entity.clone()) }, body));
+        }
+
+        None
+    }
+
     pub fn parse_header(content: &str) -> Option<(Metadata, Option<String>, String, HeaderType)> {
         if let Some((actual_content, inner_yaml)) = split_out_yaml_front_matter(content) {
             let docs = yaml_rust::YamlLoader::load_from_str(&inner_yaml).ok()?;
@@ -519,199 +577,328 @@ use crate::schema::{Schema, EntityTypeDescription};
 
 pub struct EntityLoader {
     pub schema: Schema,
+    /// How severely each kind of drift is treated. Tolerant by default (D6).
+    pub policy: FindingPolicy,
 }
 
 impl EntityLoader {
     pub fn new() -> EntityLoader {
         EntityLoader {
             schema: Schema::new(),
+            policy: FindingPolicy::default(),
         }
+    }
+
+    /// Reads under a different policy — `FindingPolicy::strict()` to refuse a tree that
+    /// drifts at all, `silent()` to take the data and ask no questions.
+    #[must_use]
+    pub fn with_policy(mut self, policy: FindingPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     pub fn get_entity_type(&self, entity_type: &str) -> anyhow::Result<&EntityTypeDescription> {
         self.schema.get_entity_type(entity_type)
     }
 
+    /// Loads the root of a tree. The root is always `Inside` (§2), so it is the one node
+    /// that inherits nothing.
+    pub fn try_load_root(
+        &self,
+        fs: &dyn Xfs,
+        base_path: &Path,
+        entity_type: &str,
+    ) -> anyhow::Result<Option<Entity>> {
+        self.try_load_entity(fs, base_path, &EntityPath::empty(), entity_type, Layout::Inside)
+    }
+
+    /// Loads one entity and its descendants.
+    ///
+    /// `inherited_layout` is the layout of the parent *instance* this node is being
+    /// loaded beneath: a type that declares no `layout` of its own takes that one (§2.1).
+    /// Callers starting at the root should use [`Self::try_load_root`].
+    ///
+    /// Reading is tolerant. A node that does not match its type's intent still loads, and
+    /// the difference is recorded on it as a [`Finding`]; only a finding the policy rates
+    /// `Severity::Error` fails the call.
     pub fn try_load_entity(
         &self,
         fs: &dyn Xfs,
         base_path: &Path,
         entity_path: &EntityPath,
         entity_type: &str,
+        inherited_layout: Layout,
     ) -> anyhow::Result<Option<Entity>> {
-        // Root element is special
         let is_root = entity_path.entries.is_empty();
-        if is_root {
-            // Root must be a directory
-            let root_path = entity_path.to_pathbuf(base_path);
-            if !fs.is_dir(&root_path) {
-                bail!("Root entity at {} must be a directory", root_path.display());
-            }
+        let stem = placement::stem(base_path, entity_path);
+        if is_root && !fs.is_dir(&stem) {
+            bail!("Root entity at {} must be a directory", stem.display());
         }
 
-        // Try loading the content
-        let directory_exists = fs.is_dir(&entity_path.to_pathbuf(base_path));
-        let dot_content_file = entity_path.to_pathbuf(base_path).with_added_extension("md");
-        let slash_content_file = entity_path.to_pathbuf(base_path).join("content.md");
+        let mut sink = FindingSink::new(self.policy.clone());
+        let at = |kind: FindingKind| Finding { path: entity_path.clone(), kind };
 
-        let (content_str, is_parallel) = if !is_root {
-            if let Some(c) = utils::try_load_file_as_string(fs, &dot_content_file)? {
-                if fs.is_file(&slash_content_file) {
-                    bail!(
-                        "Both {} and {} exist.",
-                        dot_content_file.display(),
-                        slash_content_file.display()
-                    );
-                }
-                (Some(c), true)
-            } else {
-                (utils::try_load_file_as_string(fs, &slash_content_file)?, false)
-            }
-        } else {
-            (utils::try_load_file_as_string(fs, &slash_content_file)?, false)
-        };
+        // ---- Probe. Existence only: which file *wins* cannot be decided until the type
+        // is known, and the type may itself be recorded in one of these files.
+        let directory_exists = fs.is_dir(&stem);
+        let parallel_content =
+            placement::content_path(base_path, entity_path, ContentLocation::Parallel);
+        let inside_content =
+            placement::content_path(base_path, entity_path, ContentLocation::Inside);
+        // The root has no filename to hang a parallel file off, so only `Inside` exists.
+        let has_parallel_content = !is_root && fs.is_file(&parallel_content);
+        let has_inside_content = fs.is_file(&inside_content);
 
-        let (content, metadata_from_content) = if let Some(c) = content_str {
-            let (m, a) = utils::parse_header(&c)
-                .map(|(m, separator, a, header_type)| {
-                    let origin = MetaOrigin::Header { header_type, separator };
-                    (Some(MetaSource { origin, state: MetaState::Parsed(m) }), a)
-                })
-                .unwrap_or((None, c));
-            if is_parallel {
-                (EntityContent::Parallel(a), m)
-            } else {
-                (EntityContent::Inside(a), m)
-            }
-        } else {
-            (EntityContent::None, None)
-        };
-
-        // Try loading the metadata
-        let dot_metadata_file = entity_path
-            .to_pathbuf(base_path)
-            .with_extension("meta.toml");
-        let slash_metadata_file = entity_path.to_pathbuf(base_path).join("meta.toml");
-        let dot_metadata = if !is_root {
-            utils::try_load_file_as_metadata(fs, &dot_metadata_file)?
-        } else {
-            None
-        };
-        let slash_metadata = utils::try_load_file_as_metadata(fs, &slash_metadata_file)?;
-
+        // ---- Sidecars. Both are read; a file that does not parse is kept rather than
+        // being allowed to abort the load (D3).
         let mut meta_sources = Vec::new();
-        if let Some(m) = dot_metadata {
-            meta_sources.push(MetaSource {
-                origin: MetaOrigin::ParallelSidecar,
-                state: MetaState::Parsed(m),
-            });
+        if !is_root {
+            let path =
+                placement::sidecar_path(base_path, entity_path, MetaLocation::ParallelSidecar)
+                    .expect("a sidecar location always has a path");
+            if let Some(source) =
+                utils::try_load_sidecar(fs, &path, MetaOrigin::ParallelSidecar, entity_path)?
+            {
+                meta_sources.push(source);
+            }
         }
-        if let Some(m) = slash_metadata {
-            meta_sources.push(MetaSource {
-                origin: MetaOrigin::InsideSidecar,
-                state: MetaState::Parsed(m),
-            });
+        {
+            let path = placement::sidecar_path(base_path, entity_path, MetaLocation::InsideSidecar)
+                .expect("a sidecar location always has a path");
+            if let Some(source) =
+                utils::try_load_sidecar(fs, &path, MetaOrigin::InsideSidecar, entity_path)?
+            {
+                meta_sources.push(source);
+            }
         }
-        if let Some(m) = metadata_from_content {
-            meta_sources.push(m);
+
+        // ---- Type, then layout, then the content choice.
+        //
+        // Choosing between two content files needs the intended layout, which needs the
+        // type, which may itself live in the losing file's front matter. Where both files
+        // exist that is genuinely circular, so the type is resolved from the sidecars
+        // alone; where only one exists there is nothing to choose and its header takes
+        // part in typing normally, since it is read before the type is needed.
+        let sidecars_only = EntityMeta::of(meta_sources.clone());
+        let forced_content = match (has_parallel_content, has_inside_content) {
+            (true, false) => Some((ContentLocation::Parallel, &parallel_content)),
+            (false, true) => Some((ContentLocation::Inside, &inside_content)),
+            _ => None,
+        };
+        let early_header = match forced_content {
+            Some((_, path)) => utils::try_load_file_as_string(fs, path)?
+                .and_then(|c| utils::parse_header_source(&c, entity_path))
+                .map(|(source, _)| source),
+            None => None,
+        };
+        let typing_meta = match &early_header {
+            Some(h) => {
+                let mut v = meta_sources.clone();
+                v.push(h.clone());
+                EntityMeta::of(v)
+            }
+            None => sidecars_only,
+        };
+
+        let actual_type = self.resolve_type(entity_path, entity_type, &typing_meta, &mut sink)?;
+        let ctype = self.schema.compiled(&actual_type)?;
+
+        let layout = if is_root {
+            if ctype.desc.layout == Some(Layout::Parallel) {
+                bail!(
+                    "Root type '{}' declares layout = \"parallel\", but the root is always \
+                     inside: it has no parent filename to sit beside",
+                    actual_type
+                );
+            }
+            if let Some(r) = ctype.rules.iter().find(|r| r.rule.edge == Edge::Dot) {
+                bail!(
+                    "Root type '{}' declares edge = \"dot\" for '{}', but the root has no \
+                     dot children: there is no filename to prefix",
+                    actual_type,
+                    r.rule.name_regex
+                );
+            }
+            Layout::Inside
+        } else {
+            ctype.desc.layout.unwrap_or(inherited_layout)
+        };
+        let intended_content = layout.content_location();
+
+        // ---- Read the content, now that intent can pick.
+        let chosen = match (has_parallel_content, has_inside_content) {
+            (false, false) => None,
+            (true, true) => {
+                // §4.4: intent picks, and the file that lost is reported. Neither is
+                // deleted; both were previously a hard error.
+                let (keep, lost, lost_path) = match intended_content {
+                    ContentLocation::Parallel => {
+                        (ContentLocation::Parallel, ContentLocation::Inside, &inside_content)
+                    }
+                    ContentLocation::Inside => {
+                        (ContentLocation::Inside, ContentLocation::Parallel, &parallel_content)
+                    }
+                };
+                sink.report(at(FindingKind::StrayContent {
+                    path: lost_path.clone(),
+                    location: lost,
+                }))?;
+                Some(keep)
+            }
+            (true, false) => Some(ContentLocation::Parallel),
+            (false, true) => Some(ContentLocation::Inside),
+        };
+        if let Some(actual) = chosen {
+            if actual != intended_content {
+                sink.report(at(FindingKind::ContentLocationNonconformance {
+                    actual,
+                    intended: intended_content,
+                }))?;
+            }
         }
-        // Several sources merge per key (D2); the ambiguity is reported as a finding in
-        // Task 6 rather than refused here.
+
+        let (content, header_source) = match chosen {
+            None => (EntityContent::None, None),
+            Some(loc) => {
+                let path = match loc {
+                    ContentLocation::Parallel => &parallel_content,
+                    ContentLocation::Inside => &inside_content,
+                };
+                let raw = utils::try_load_file_as_string(fs, path)?.unwrap_or_default();
+                let (source, body) = match utils::parse_header_source(&raw, entity_path) {
+                    Some((source, body)) => (Some(source), body),
+                    None => (None, raw),
+                };
+                let content = match loc {
+                    ContentLocation::Parallel => EntityContent::Parallel(body),
+                    ContentLocation::Inside => EntityContent::Inside(body),
+                };
+                (content, source)
+            }
+        };
+        if let Some(h) = header_source {
+            meta_sources.push(h);
+        }
         let metadata = EntityMeta::of(meta_sources);
 
-        // Now get the children!
-        let dot_children = if !is_root {
-            utils::find_dot_children(fs, base_path, entity_path)?
-        } else {
-            vec![]
-        };
-        let slash_children = utils::find_slash_children(fs, base_path, entity_path)?;
-        let children = dot_children
-            .into_iter()
-            .chain(slash_children)
-            .collect::<Vec<EntityPath>>();
+        // ---- Report what the metadata turned out to be.
+        for source in metadata.malformed() {
+            sink.report(at(FindingKind::MalformedMetadata {
+                location: source.location(),
+                path: placement::sidecar_path(base_path, entity_path, source.location()),
+                error: source.error().unwrap_or("unknown error").to_string(),
+            }))?;
+        }
+        for conflict in metadata.conflicts() {
+            sink.report(at(FindingKind::MetadataKeyConflict {
+                key: conflict.key,
+                locations: conflict.locations,
+            }))?;
+        }
+        if metadata.sources().len() > 1 {
+            sink.report(at(FindingKind::SplitMetadata {
+                keys_by_location: metadata.keys_by_location(),
+            }))?;
+        }
+        for source in metadata.sources() {
+            // In-header metadata is orthogonal to layout (D2), so it is never misplaced.
+            let actual = source.location();
+            if actual != MetaLocation::InHeader && actual != layout.sidecar_location() {
+                sink.report(at(FindingKind::MetadataLocationNonconformance {
+                    actual,
+                    intended: layout.sidecar_location(),
+                }))?;
+            }
+        }
 
-        let has_children = !children.is_empty();
+        // ---- Children, through the one resolver both readers share.
+        let resolved = discovery::resolve_children(fs, base_path, entity_path, ctype, &mut sink)?;
 
-        if content.is_none() && metadata.is_none() && !has_children && !directory_exists {
+        // §6: a node with nothing at all behind it is not a node.
+        if content.is_none() && metadata.is_none() && resolved.is_empty() && !directory_exists {
             return Ok(None);
         }
 
-        // Determine the actual type
-        let actual_type = if entity_type == "Auto" {
-            let m = metadata.merged()?.ok_or_else(|| {
-                anyhow!(
-                    "Entity at '{:?}' has Auto type but no metadata",
-                    entity_path.to_pathbuf(base_path)
-                )
-            })?;
-            let t = m.get_str("type")?.ok_or_else(|| {
-                anyhow!(
-                    "Entity at '{:?}' has Auto type but metadata is missing 'type' key",
-                    entity_path.to_pathbuf(base_path)
-                )
-            })?;
-            if t == "Auto" {
-                bail!(
-                    "Entity at '{:?}' has metadata 'type' set to 'Auto', which is not allowed",
-                    entity_path.to_pathbuf(base_path)
-                );
-            }
-            t
-        } else {
-            if let Some(m) = metadata.merged()? {
-                if let Some(t) = m.get_str("type")? {
-                    if t != entity_type {
-                        bail!("Entity at '{:?}' has type '{}' in metadata, but was expected to be '{}'", entity_path.to_pathbuf(base_path), t, entity_type);
-                    }
-                }
-            }
-            entity_type.to_string()
-        };
-
-        let entity_type_descriptor = self.get_entity_type(&actual_type)?;
-
-        // Work through the children and load them.
-        let mut loaded_children: Vec<Entity> = vec![];
-        for child_entity_path in children {
-            let child_name = child_entity_path.last_name().unwrap();
-            if entity_type_descriptor.ignore.iter().any(|s| s == child_name) {
-                continue;
-            }
-            let mut found_match = false;
-            for child_rule in &entity_type_descriptor.children {
-                let re = regex::Regex::new(&child_rule.name_regex).unwrap();
-                if re.is_match(child_name) {
-                    let child_entity = self.try_load_entity(
-                        fs,
-                        base_path,
-                        &child_entity_path,
-                        &child_rule.node_type,
-                    ).with_context(|| format!("error loading child entity '{}' of type '{}' for parent entity '{:?}'", child_name, &child_rule.node_type, entity_path.to_pathbuf(base_path)))?;
-                    if let Some(ce) = child_entity {
-                        loaded_children.push(ce);
-                        found_match = true;
-                        break;
-                    }
-                }
-            }
-            if !found_match && !entity_type_descriptor.allow_additional {
-                bail!(
-                    "Unexpected child entity '{}' in entity '{:?}'",
-                    child_name,
-                    entity_path.to_pathbuf(base_path)
-                );
+        let mut children: Vec<Entity> = vec![];
+        for child in resolved {
+            // §7.2: an `allow_additional` child matched no rule, so its type is whatever
+            // its own metadata says.
+            let child_type = child.node_type.as_deref().unwrap_or("Auto");
+            let loaded = self
+                .try_load_entity(fs, base_path, &child.path, child_type, layout)
+                .with_context(|| {
+                    format!(
+                        "error loading child entity '{}' of type '{}' for parent entity '{:?}'",
+                        child.name,
+                        child_type,
+                        entity_path.local_path()
+                    )
+                })?;
+            // C8: a name that matched a rule but has nothing behind it is simply not a
+            // child. It is not an error.
+            if let Some(e) = loaded {
+                children.push(e);
             }
         }
 
-        let entity = Entity {
+        Ok(Some(Entity {
             path: entity_path.clone(),
             node_type: actual_type,
             content,
             metadata,
-            children: loaded_children,
+            children,
+            layout,
+            findings: sink.into_findings(),
+        }))
+    }
+
+    /// The type this node actually is: what its metadata claims, checked against what the
+    /// parent's rule assigned. §7.1.
+    ///
+    /// A disagreement is a [`FindingKind::TypeMismatch`], which the default policy rates
+    /// `Error` — so the existing refusal is preserved, but a caller can downgrade it.
+    fn resolve_type(
+        &self,
+        entity_path: &EntityPath,
+        entity_type: &str,
+        metadata: &EntityMeta,
+        sink: &mut FindingSink,
+    ) -> anyhow::Result<String> {
+        // A malformed source is already reported on its own; falling back here keeps a
+        // load that D3 says must survive from failing on the type lookup instead.
+        let declared = match metadata.merged() {
+            Ok(Some(m)) => m.get_str("type")?,
+            Ok(None) | Err(_) => None,
         };
-        Ok(Some(entity))
+
+        if entity_type != "Auto" {
+            if let Some(found) = declared {
+                if found != entity_type {
+                    sink.report(Finding {
+                        path: entity_path.clone(),
+                        kind: FindingKind::TypeMismatch {
+                            expected: entity_type.to_string(),
+                            found,
+                        },
+                    })?;
+                }
+            }
+            return Ok(entity_type.to_string());
+        }
+
+        let found = declared.ok_or_else(|| {
+            anyhow!(
+                "Entity at '{:?}' has Auto type but its metadata is missing the 'type' key",
+                entity_path.local_path()
+            )
+        })?;
+        if found == "Auto" {
+            bail!(
+                "Entity at '{:?}' has metadata 'type' set to 'Auto', which is not allowed",
+                entity_path.local_path()
+            );
+        }
+        Ok(found)
     }
 }
 
@@ -890,11 +1077,41 @@ impl MetaOrigin {
 pub struct MetaSource {
     pub origin: MetaOrigin,
     pub state: MetaState,
+    /// The entity this source belongs to. With [`Self::location`] it determines the
+    /// file, so no path is stored: a path would be derived state, duplicating what
+    /// [`crate::placement`] already computes and going stale the moment a node moves.
+    ///
+    /// `None` for a source built in memory for an entity that does not exist yet.
+    pub entity: Option<EntityPath>,
 }
 
 impl MetaSource {
     pub fn location(&self) -> MetaLocation {
         self.origin.location()
+    }
+
+    /// Names this source to a person, as a path relative to the tree root — the same
+    /// coordinate system as [`EntityPath::local_path`], and the one whoever is editing
+    /// the tree thinks in.
+    ///
+    /// Errors about metadata reach that person, not the programmer calling the library,
+    /// so they must name a file rather than a variant of [`MetaLocation`]. The path is
+    /// computed here rather than stored, so it cannot disagree with where the file
+    /// actually is. The fallbacks describe the source in the same register.
+    pub fn describe(&self) -> String {
+        let Some(entity) = &self.entity else {
+            return match self.origin {
+                MetaOrigin::Header { .. } => "the front matter".to_string(),
+                MetaOrigin::ParallelSidecar => "the sidecar beside the entity".to_string(),
+                MetaOrigin::InsideSidecar => "the sidecar in the entity directory".to_string(),
+            };
+        };
+        match crate::placement::sidecar_path(Path::new(""), entity, self.location()) {
+            Some(p) => p.display().to_string(),
+            // In-header metadata has no file of its own; it is in whichever file holds
+            // the content, which the entity names.
+            None => format!("the front matter of {}", entity.local_path().display()),
+        }
     }
 
     /// The parsed table, or `None` if this source is malformed.
@@ -955,21 +1172,33 @@ impl EntityMeta {
         EntityMeta { sources }
     }
 
-    /// A single parsed source at `origin`.
-    pub fn at(origin: MetaOrigin, m: Metadata) -> EntityMeta {
-        EntityMeta::of(vec![MetaSource { origin, state: MetaState::Parsed(m) }])
+    /// A single parsed source at `origin`, belonging to `entity`.
+    pub fn at(entity: EntityPath, origin: MetaOrigin, m: Metadata) -> EntityMeta {
+        EntityMeta::of(vec![MetaSource {
+            origin,
+            state: MetaState::Parsed(m),
+            entity: Some(entity),
+        }])
     }
 
-    pub fn parallel(m: Metadata) -> EntityMeta {
-        EntityMeta::at(MetaOrigin::ParallelSidecar, m)
+    /// A single parsed source for an entity that does not exist yet, so cannot name a
+    /// file. Used while building a child, before its path is settled.
+    pub fn unplaced(origin: MetaOrigin, m: Metadata) -> EntityMeta {
+        EntityMeta::of(vec![MetaSource { origin, state: MetaState::Parsed(m), entity: None }])
     }
 
-    pub fn inside(m: Metadata) -> EntityMeta {
-        EntityMeta::at(MetaOrigin::InsideSidecar, m)
+    pub fn parallel(entity: EntityPath, m: Metadata) -> EntityMeta {
+        EntityMeta::at(entity, MetaOrigin::ParallelSidecar, m)
     }
 
-    pub fn in_header(m: Metadata, separator: Option<String>, header_type: HeaderType) -> EntityMeta {
-        EntityMeta::at(MetaOrigin::Header { header_type, separator }, m)
+    pub fn inside(entity: EntityPath, m: Metadata) -> EntityMeta {
+        EntityMeta::at(entity, MetaOrigin::InsideSidecar, m)
+    }
+
+    pub fn in_header(
+        entity: EntityPath, m: Metadata, separator: Option<String>, header_type: HeaderType,
+    ) -> EntityMeta {
+        EntityMeta::at(entity, MetaOrigin::Header { header_type, separator }, m)
     }
 
     pub fn sources(&self) -> &[MetaSource] {
@@ -1062,19 +1291,50 @@ impl EntityMeta {
             .collect()
     }
 
+    /// The keys each source holds, in location order. Describes a node whose metadata is
+    /// split across sources — a shape that is observable but was never intendable (§9.1).
+    pub fn keys_by_location(&self) -> Vec<(MetaLocation, Vec<String>)> {
+        self.sources
+            .iter()
+            .map(|source| {
+                let keys = source
+                    .metadata()
+                    .and_then(|m| m.value.as_table())
+                    .map(|t| t.keys().cloned().collect())
+                    .unwrap_or_default();
+                (source.location(), keys)
+            })
+            .collect()
+    }
+
     /// Every parsed source merged into one table, later locations winning.
     /// `Ok(None)` when there is nothing parsed to merge.
     ///
     /// # Errors
     ///
     /// Returns an error if a source parsed to something other than a table.
+    /// All sources merged into one table, later locations winning. `Ok(None)` when there
+    /// is nothing to merge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any source failed to parse. A caller reading a value out of
+    /// this node cannot be told "absent" when the truth is "unreadable" — the file may
+    /// well contain the key. Inspect and repair such a source through [`Self::malformed`],
+    /// which does not merge and does not fail.
     pub fn merged(&self) -> anyhow::Result<Option<Metadata>> {
         let mut out = toml::Table::new();
         let mut any = false;
         for source in &self.sources {
-            let Some(m) = source.metadata() else { continue };
+            let Some(m) = source.metadata() else {
+                bail!(
+                    "Metadata in {} could not be parsed: {}",
+                    source.describe(),
+                    source.error().unwrap_or("unknown error")
+                )
+            };
             let table = m.value.as_table().ok_or_else(|| {
-                anyhow!("Metadata at {:?} is not a table", source.location())
+                anyhow!("Metadata in {} is not a table", source.describe())
             })?;
             for (key, value) in table {
                 out.insert(key.clone(), value.clone());
@@ -1106,6 +1366,24 @@ pub struct Entity {
     pub content: EntityContent,
     pub metadata: EntityMeta,
     pub children: Vec<Entity>,
+    /// The layout this node was resolved under: declared by its type, or inherited from
+    /// the parent instance it was loaded beneath (§2.1). The root is always `Inside`.
+    pub layout: Layout,
+    /// Drift observed on *this* node. Each child carries its own; use
+    /// [`Self::all_findings`] to walk the tree. §9.1, D4.
+    pub findings: Vec<Finding>,
+}
+
+impl Entity {
+    /// This node's findings and every descendant's, depth first. Each carries the
+    /// `EntityPath` of the node it was observed on, so the caller can tell them apart.
+    pub fn all_findings(&self) -> Vec<Finding> {
+        let mut out = self.findings.clone();
+        for child in &self.children {
+            out.extend(child.all_findings());
+        }
+        out
+    }
 }
 
 /// Parse front matter (TOML or YAML) from a Markdown content string.
@@ -1168,16 +1446,15 @@ mod common {
 #[cfg(test)]
 mod meta_tests {
     use super::*;
-    use crate::placement::MetaLocation;
 
     /// Builds a source the way the loader will: parse the text, and on failure keep it
-    /// verbatim alongside the real parse error.
+    /// verbatim alongside the real parse error and the file it came from.
     fn source(origin: MetaOrigin, raw: &str) -> MetaSource {
         let state = match toml::from_str::<toml::Value>(raw) {
             Ok(value) => MetaState::Parsed(Metadata { value }),
             Err(e) => MetaState::Malformed { raw: raw.to_string(), error: e.to_string() },
         };
-        MetaSource { origin, state }
+        MetaSource { origin, state, entity: Some(EntityPath::empty().extend_slash("ch1")) }
     }
 
     fn header(raw: &str) -> MetaSource {
@@ -1342,7 +1619,24 @@ mod meta_tests {
         assert_eq!(bad[0].raw(), Some("this is not = = toml"), "kept verbatim for repair");
         assert!(bad[0].error().is_some(), "and the parse error with it");
 
-        assert_eq!(m.get_str("type").unwrap().as_deref(), Some("T"), "the good source still reads");
+        // Reading through the node is refused: the bad file may well hold `type` too,
+        // so answering from the good source alone would be a guess.
+        let err = m.get_str("type").unwrap_err().to_string();
+        assert!(err.contains("ch1.meta.toml"), "the error names the file: {}", err);
+    }
+
+    /// A source names its file the way the rest of the crate does — relative to the tree
+    /// root, as [`EntityPath::local_path`] does — so a message can be read by whoever is
+    /// editing the tree, and an entity re-loaded from a new base path is still equal.
+    #[test]
+    fn a_source_names_its_file_relative_to_the_tree_root() {
+        assert_eq!(parallel("n = 1").describe(), "ch1.meta.toml");
+        assert_eq!(
+            source(MetaOrigin::InsideSidecar, "n = 1").describe(),
+            "ch1/meta.toml"
+        );
+        // A header has no file of its own, so it names the entity whose content holds it.
+        assert_eq!(header("n = 1").describe(), "the front matter of ch1");
     }
 }
 
@@ -1350,6 +1644,7 @@ mod meta_tests {
 mod entity_tests {
 
     use inscenerator_xfs::mockfs;
+    use crate::findings::{FindingKindId, Severity};
     use crate::placement::Edge;
     use crate::schema::ChildEntityRules;
 
@@ -1384,7 +1679,7 @@ mod entity_tests {
     //             &PathBuf::from("foo"),
     //             &entity_path,
     //             "TestType",
-    //         )
+    //         , Layout::Inside)
     //         .unwrap();
     //     let e = entity.unwrap();
     //     assert!(e.content.is_none());
@@ -1405,7 +1700,7 @@ mod entity_tests {
         let entity_path = EntityPath::empty().extend_slash("entity1");
 
         let entity = loader
-            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType")
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType", Layout::Inside)
             .unwrap();
         let e = entity.expect("Entity should be loaded");
         assert_eq!(e.content, EntityContent::inside("Hello, world!"));
@@ -1426,7 +1721,7 @@ mod entity_tests {
         let entity_path = EntityPath::empty().extend_slash("entity1");
 
         let entity = loader
-            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType")
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType", Layout::Inside)
             .unwrap();
         let e = entity.expect("Entity should be loaded");
         assert_eq!(e.content, EntityContent::parallel("Hello, world!"));
@@ -1446,7 +1741,7 @@ mod entity_tests {
         let entity_path = EntityPath::empty().extend_slash("entity1");
 
         let entity = loader
-            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType")
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType", Layout::Inside)
             .unwrap();
         let e = entity.unwrap();
         assert_eq!(e.content, EntityContent::None);
@@ -1454,9 +1749,10 @@ mod entity_tests {
         assert_eq!(e.path, entity_path);
         assert_eq!(
             e.metadata,
-            EntityMeta::inside(Metadata {
-                value: toml::from_str("bar=\"foo\"\n").unwrap()
-            })
+            EntityMeta::inside(
+                entity_path.clone(),
+                Metadata { value: toml::from_str("bar=\"foo\"\n").unwrap() }
+            )
         );
         assert_eq!(e.node_type, "TestType".to_string());
     }
@@ -1471,7 +1767,7 @@ mod entity_tests {
         let entity_path = EntityPath::empty().extend_slash("entity1");
 
         let entity = loader
-            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType")
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType", Layout::Inside)
             .unwrap();
         let e = entity.unwrap();
         assert_eq!(e.content, EntityContent::None);
@@ -1479,9 +1775,10 @@ mod entity_tests {
         assert_eq!(e.path, entity_path);
         assert_eq!(
             e.metadata,
-            EntityMeta::parallel(Metadata {
-                value: toml::from_str("bar=\"foo\"\n").unwrap()
-            })
+            EntityMeta::parallel(
+                entity_path.clone(),
+                Metadata { value: toml::from_str("bar=\"foo\"\n").unwrap() }
+            )
         );
         assert_eq!(e.node_type, "TestType".to_string());
     }
@@ -1495,7 +1792,7 @@ mod entity_tests {
         let entity_path = EntityPath::empty().extend_slash("entity1");
 
         let entity = loader
-            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType")
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType", Layout::Inside)
             .unwrap();
         let e = entity.unwrap();
         assert_eq!(e.children.len(), 1);
@@ -1514,7 +1811,7 @@ mod entity_tests {
         let entity_path = EntityPath::empty().extend_slash("entity1");
 
         let entity = loader
-            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType")
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType", Layout::Inside)
             .unwrap();
         let e = entity.unwrap();
         assert_eq!(e.children.len(), 1);
@@ -1535,7 +1832,7 @@ mod entity_tests {
         let entity_path = EntityPath::empty().extend_slash("entity1");
 
         let entity = loader
-            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType")
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType", Layout::Inside)
             .unwrap();
         let e = entity.unwrap();
         assert_eq!(e.children.len(), 2);
@@ -1565,6 +1862,7 @@ mod entity_tests {
                 &PathBuf::from("foo"),
                 &entity_path.extend_dot("child1"),
                 "ChildTestType",
+                Layout::Inside,
             )
             .unwrap();
         let child1 = entity.unwrap();
@@ -1672,7 +1970,7 @@ mod entity_tests {
 
         let loader = dummy_loader();
         let entity = loader
-            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType")
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType", Layout::Inside)
             .unwrap();
 
         let e = entity.unwrap();
@@ -1776,7 +2074,7 @@ mod entity_tests {
 
         let entity_path = EntityPath::empty();
         let entity = loader
-            .try_load_entity(&fs, &PathBuf::from("project"), &entity_path, "Project")
+            .try_load_entity(&fs, &PathBuf::from("project"), &entity_path, "Project", Layout::Inside)
             .unwrap();
         let e = entity.unwrap();
         assert_eq!(e.children.len(), 2);
@@ -1845,6 +2143,8 @@ mod entity_tests {
             path: entity_path,
             metadata: EntityMeta::default(),
             node_type: String::from("TestType"),
+            layout: Layout::Inside,
+            findings: vec![],
         };
         let writer = EntityWriter {};
         let mut fs = mockfs::MockFS::new();
@@ -1871,6 +2171,8 @@ mod entity_tests {
             path: entity_path,
             metadata: EntityMeta::default(),
             node_type: String::from("TestType"),
+            layout: Layout::Parallel,
+            findings: vec![],
         };
         let writer = EntityWriter {};
         let mut fs = mockfs::MockFS::new();
@@ -1893,9 +2195,11 @@ mod entity_tests {
         let entity = Entity {
             content: EntityContent::None,
             children: vec![],
+            metadata: EntityMeta::inside(entity_path.clone(), metadata),
             path: entity_path,
-            metadata: EntityMeta::inside(metadata),
             node_type: String::from("TestType"),
+            layout: Layout::Inside,
+            findings: vec![],
         };
         let writer = EntityWriter {};
         let mut fs = mockfs::MockFS::new();
@@ -1927,6 +2231,8 @@ mod entity_tests {
             path: entity_path.extend_slash("child1"),
             metadata: EntityMeta::default(),
             node_type: String::from("ChildTestType"),
+            layout: Layout::Inside,
+            findings: vec![],
         };
         let child2 = Entity {
             content: EntityContent::inside("Child 2 content".to_string()),
@@ -1934,6 +2240,8 @@ mod entity_tests {
             path: entity_path.extend_slash("child2"),
             metadata: EntityMeta::default(),
             node_type: String::from("ChildTestType"),
+            layout: Layout::Inside,
+            findings: vec![],
         };
         let entity = Entity {
             content: EntityContent::None,
@@ -1941,6 +2249,8 @@ mod entity_tests {
             path: entity_path,
             metadata: EntityMeta::default(),
             node_type: String::from("TestType"),
+            layout: Layout::Inside,
+            findings: vec![],
         };
         let writer = EntityWriter {};
         let mut fs = mockfs::MockFS::new();
@@ -1982,6 +2292,8 @@ mod entity_tests {
             path: entity_path.extend_dot("child1"),
             metadata: EntityMeta::default(),
             node_type: String::from("ChildTestType"),
+            layout: Layout::Parallel,
+            findings: vec![],
         };
         let child2 = Entity {
             content: EntityContent::parallel("Child 2 content".to_string()),
@@ -1989,6 +2301,8 @@ mod entity_tests {
             path: entity_path.extend_dot("child2"),
             metadata: EntityMeta::default(),
             node_type: String::from("ChildTestType"),
+            layout: Layout::Parallel,
+            findings: vec![],
         };
         let entity = Entity {
             content: EntityContent::None,
@@ -1996,6 +2310,8 @@ mod entity_tests {
             path: entity_path,
             metadata: EntityMeta::default(),
             node_type: String::from("TestType"),
+            layout: Layout::Inside,
+            findings: vec![],
         };
         let writer = EntityWriter {};
         let mut fs = mockfs::MockFS::new();
@@ -2013,7 +2329,7 @@ mod entity_tests {
         let loader = dummy_loader();
         let entity_path = EntityPath::empty().extend_slash(name);
         loader
-            .try_load_entity(fs, &PathBuf::from(base), &entity_path, "TestType")
+            .try_load_entity(fs, &PathBuf::from(base), &entity_path, "TestType", Layout::Inside)
             .unwrap()
             .expect("Entity should be loaded")
     }
@@ -2066,7 +2382,8 @@ mod entity_tests {
         check_header_meta(&e.metadata, "foo", "bar", Some("\n---\n"));
     }
 
-    /// D2: a header beside a sidecar is no longer refused — both sources load and merge.
+    /// D2: a header and a sidecar on one node both load, and their keys merge.
+    /// Such a node was previously refused outright.
     #[test]
     fn test_load_entity_merges_header_and_meta_toml() {
         let content = "```toml\nfoo = \"bar\"\n```\nActual content";
@@ -2077,7 +2394,7 @@ mod entity_tests {
         let loader = dummy_loader();
         let entity_path = EntityPath::empty().extend_slash("entity1");
         let e = loader
-            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType")
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType", Layout::Inside)
             .unwrap()
             .unwrap();
 
@@ -2180,7 +2497,7 @@ mod entity_tests {
         let entity_path = EntityPath::empty().extend_slash("entity1");
 
         let entity = loader
-            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "Auto")
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "Auto", Layout::Inside)
             .unwrap();
         let e = entity.unwrap();
         assert_eq!(e.node_type, "TestType".to_string());
@@ -2195,12 +2512,12 @@ mod entity_tests {
         let loader = dummy_loader();
         let entity_path = EntityPath::empty().extend_slash("entity1");
 
-        let result = loader.try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "Auto");
+        let result = loader.try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "Auto", Layout::Inside);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("has Auto type but no metadata"));
+            .contains("missing the 'type' key"));
     }
 
     #[test]
@@ -2212,12 +2529,12 @@ mod entity_tests {
         let loader = dummy_loader();
         let entity_path = EntityPath::empty().extend_slash("entity1");
 
-        let result = loader.try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "Auto");
+        let result = loader.try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "Auto", Layout::Inside);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("missing 'type' key"));
+            .contains("missing the 'type' key"));
     }
 
     #[test]
@@ -2229,7 +2546,7 @@ mod entity_tests {
         let loader = dummy_loader();
         let entity_path = EntityPath::empty().extend_slash("entity1");
 
-        let result = loader.try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "Auto");
+        let result = loader.try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "Auto", Layout::Inside);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2247,7 +2564,7 @@ mod entity_tests {
         let entity_path = EntityPath::empty().extend_slash("entity1");
 
         let entity = loader
-            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType")
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType", Layout::Inside)
             .unwrap();
         let e = entity.unwrap();
         assert_eq!(e.node_type, "TestType".to_string());
@@ -2262,12 +2579,23 @@ mod entity_tests {
         let loader = dummy_loader();
         let entity_path = EntityPath::empty().extend_slash("entity1");
 
-        let result = loader.try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType");
-        assert!(result.is_err());
-        assert!(result
+        let err = loader
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType", Layout::Inside)
             .unwrap_err()
-            .to_string()
-            .contains("has type 'OtherType' in metadata, but was expected to be 'TestType'"));
+            .to_string();
+        assert!(err.contains("Expected type 'TestType' but metadata declares 'OtherType'"),
+            "got: {}", err);
+
+        // §7.1 / D6: the refusal comes from the policy, not from the loader. Downgraded,
+        // the node loads as the type its parent's rule assigned, with the finding on it.
+        let tolerant = dummy_loader()
+            .with_policy(FindingPolicy::default().with(FindingKindId::TypeMismatch, Severity::Warn));
+        let e = tolerant
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType", Layout::Inside)
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.node_type, "TestType");
+        assert!(e.findings.iter().any(|f| matches!(f.kind, FindingKind::TypeMismatch { .. })));
     }
 
     #[test]
@@ -2283,9 +2611,7 @@ mod entity_tests {
             let fs = fs;
 
         let mut loader = EntityLoader::new();
-        loader.schema.entity_types.insert(
-            "TestType".to_string(),
-            EntityTypeDescription {
+        loader.schema.add_entity_type(EntityTypeDescription {
                 name: "TestType".to_string(),
                 children: vec![ChildEntityRules {
                     name_regex: "^child.*$".to_string(),
@@ -2297,22 +2623,18 @@ mod entity_tests {
                 allow_additional: false,
                 layout: None,
                 ignore: vec![],
-            },
-        );
-        loader.schema.entity_types.insert(
-            "ChildTestType".to_string(),
-            EntityTypeDescription {
+            }).unwrap();
+        loader.schema.add_entity_type(EntityTypeDescription {
                 name: "ChildTestType".to_string(),
                 children: vec![],
                 allow_additional: false,
                 layout: None,
                 ignore: vec![],
-            },
-        );
+            }).unwrap();
 
         let entity_path = EntityPath::empty().extend_slash("parent");
         let entity = loader
-            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType")
+            .try_load_entity(&fs, &PathBuf::from("foo"), &entity_path, "TestType", Layout::Inside)
             .unwrap();
         let e = entity.unwrap();
         assert_eq!(e.children.len(), 1);
@@ -2326,20 +2648,17 @@ mod entity_tests {
         let fs = fs;
 
         let mut loader = EntityLoader::new();
-        loader.schema.entity_types.insert(
-            "Project".to_string(),
-            EntityTypeDescription {
+        loader.schema.add_entity_type(EntityTypeDescription {
                 name: "Project".to_string(),
                 children: vec![],
                 allow_additional: true,
                 layout: None,
                 ignore: vec![],
-            },
-        );
+            }).unwrap();
 
         let entity_path = EntityPath::empty();
         let entity = loader
-            .try_load_entity(&fs, &PathBuf::from("project"), &entity_path, "Auto")
+            .try_load_entity(&fs, &PathBuf::from("project"), &entity_path, "Auto", Layout::Inside)
             .unwrap();
         let e = entity.unwrap();
         assert_eq!(e.node_type, "Project".to_string());
@@ -2375,7 +2694,7 @@ mod entity_tests {
         }).unwrap();
 
         let entity = loader
-            .try_load_entity(&fs, &PathBuf::from("project"), &EntityPath::empty(), "Project")
+            .try_load_root(&fs, &PathBuf::from("project"), "Project")
             .unwrap()
             .unwrap();
         assert_eq!(entity.children.len(), 1);
@@ -2413,7 +2732,7 @@ mod entity_tests {
 
         let entity_path = EntityPath::empty().extend_slash("parent");
         let entity = loader
-            .try_load_entity(&fs, &PathBuf::from("project"), &entity_path, "Parent")
+            .try_load_entity(&fs, &PathBuf::from("project"), &entity_path, "Parent", Layout::Inside)
             .unwrap()
             .unwrap();
         assert_eq!(entity.children.len(), 1);
@@ -2451,7 +2770,7 @@ mod entity_tests {
         }).unwrap();
 
         let entity = loader
-            .try_load_entity(&fs, &PathBuf::from("project"), &EntityPath::empty(), "Project")
+            .try_load_root(&fs, &PathBuf::from("project"), "Project")
             .unwrap()
             .unwrap();
         assert_eq!(entity.children.len(), 1);
@@ -2631,3 +2950,241 @@ mod entity_tests {
 //         .to_string();
 //     assert_eq!(child2_content, "Child 2 content");
 // }
+
+#[cfg(test)]
+mod loader_tests {
+    use super::*;
+    use crate::findings::{FindingKind, FindingPolicy};
+    use crate::placement::{ContentLocation, Layout, MetaLocation};
+    use crate::schema::Schema;
+    use inscenerator_xfs::mockfs;
+    use std::path::PathBuf;
+
+    fn fs_with(files: &[(&str, &str)]) -> mockfs::MockFS {
+        let mut fs = mockfs::MockFS::new();
+        fs.create_dir_all(&PathBuf::from("foo")).unwrap();
+        for (path, content) in files {
+            let p = PathBuf::from(path);
+            fs.create_dir_all(p.parent().unwrap()).unwrap();
+            fs.add_r(&p, content.as_bytes().to_vec()).unwrap();
+        }
+        fs
+    }
+
+    /// Root (inside, forced) > Chapter (declares parallel) > Section (declares nothing,
+    /// so it takes its layout from the Chapter instance it is loaded beneath).
+    const SCHEMA: &str = r#"
+[Root]
+allow_additional = false
+[[Root.children]]
+name_regex = "^ch"
+node_type = "Chapter"
+
+[Chapter]
+allow_additional = false
+layout = "parallel"
+[[Chapter.children]]
+name_regex = '^\d{3}-'
+node_type = "Section"
+edge = "slash"
+[[Chapter.children]]
+name_regex = "^review$"
+node_type = "Section"
+edge = "dot"
+
+[Section]
+allow_additional = false
+children = []
+"#;
+
+    fn loader_with(schema_src: &str) -> EntityLoader {
+        let mut loader = EntityLoader::new();
+        loader.schema = Schema::load_from_str(schema_src).unwrap();
+        loader
+    }
+
+    fn loader() -> EntityLoader {
+        loader_with(SCHEMA)
+    }
+
+    fn load_root(loader: &EntityLoader, fs: &mockfs::MockFS) -> Entity {
+        loader
+            .try_load_root(fs, &PathBuf::from("foo"), "Root")
+            .unwrap()
+            .unwrap()
+    }
+
+    /// The `ch1` child of the root, which every test below builds under.
+    fn load_ch1(fs: &mockfs::MockFS) -> Entity {
+        let root = load_root(&loader(), fs);
+        root.children
+            .into_iter()
+            .find(|c| c.path.last_name() == Some("ch1"))
+            .expect("no ch1 child")
+    }
+
+    fn kinds(e: &Entity) -> Vec<&FindingKind> {
+        e.findings.iter().map(|f| &f.kind).collect()
+    }
+
+    /// §4.4: where both `S.md` and `S/content.md` exist, intended layout picks the
+    /// content and the file that lost is reported. The pair was previously a hard error.
+    #[test]
+    fn both_content_files_resolve_by_intended_layout() {
+        let fs = fs_with(&[
+            ("foo/ch1.md", "parallel body"),
+            ("foo/ch1/content.md", "inside body"),
+        ]);
+
+        let ch1 = load_ch1(&fs);
+
+        assert_eq!(ch1.content, EntityContent::Parallel("parallel body".into()));
+        assert!(kinds(&ch1).iter().any(|k| matches!(
+            k,
+            FindingKind::StrayContent { location: ContentLocation::Inside, path }
+                if path == &PathBuf::from("foo/ch1/content.md")
+        )));
+    }
+
+    /// C1 (reader): a dot child's sidecar is its stem with `.meta.toml` **appended**.
+    /// Substituting would resolve `ch1.review` onto its parent's `ch1.meta.toml`.
+    #[test]
+    fn a_dot_childs_sidecar_is_read_from_its_own_appended_name() {
+        let fs = fs_with(&[
+            ("foo/ch1.md", "chapter"),
+            ("foo/ch1.meta.toml", "owner = \"parent\""),
+            ("foo/ch1.review.md", "review"),
+            ("foo/ch1.review.meta.toml", "owner = \"child\""),
+        ]);
+
+        let ch1 = load_ch1(&fs);
+        let review = ch1
+            .children
+            .iter()
+            .find(|c| c.path.last_name() == Some("review"))
+            .expect("no review child");
+
+        assert_eq!(ch1.metadata.get_str("owner").unwrap().as_deref(), Some("parent"));
+        assert_eq!(review.metadata.get_str("owner").unwrap().as_deref(), Some("child"));
+    }
+
+    /// §2.1: layout is inherited by *instance*. Section declares none, so it takes
+    /// Parallel from the chapter it was loaded beneath — not a default of its own.
+    #[test]
+    fn layout_is_inherited_from_the_parent_instance() {
+        let fs = fs_with(&[
+            ("foo/ch1.md", "chapter"),
+            ("foo/ch1/010-intro.md", "section"),
+        ]);
+
+        let ch1 = load_ch1(&fs);
+
+        assert_eq!(ch1.layout, Layout::Parallel);
+        assert_eq!(ch1.children.len(), 1);
+        assert_eq!(ch1.children[0].layout, Layout::Parallel);
+        assert_eq!(
+            ch1.children[0].content,
+            EntityContent::Parallel("section".into())
+        );
+        assert!(ch1.children[0].findings.is_empty(), "a conforming node is quiet");
+    }
+
+    /// §2: the root is always inside, whatever its type says — and a type declaring
+    /// otherwise for the root is a schema error, not drift to be tolerated.
+    #[test]
+    fn the_root_is_always_inside() {
+        let fs = fs_with(&[("foo/content.md", "root body")]);
+
+        let root = load_root(&loader(), &fs);
+        assert_eq!(root.layout, Layout::Inside);
+        assert_eq!(root.content, EntityContent::Inside("root body".into()));
+
+        let err = loader_with("[Root]\nallow_additional = false\nlayout = \"parallel\"\nchildren = []\n")
+            .try_load_root(&fs, &PathBuf::from("foo"), "Root")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("root"), "got: {}", err);
+    }
+
+    /// C7: a node whose content and metadata follow different layouts loads correctly,
+    /// and the mismatch is reported rather than repaired.
+    #[test]
+    fn a_mixed_node_loads_and_reports_its_metadata_location() {
+        let fs = fs_with(&[
+            ("foo/ch1.md", "body"),
+            ("foo/ch1/meta.toml", "k = 1"),
+        ]);
+
+        let ch1 = load_ch1(&fs);
+
+        assert_eq!(ch1.content.content(), Some("body"));
+        assert_eq!(ch1.metadata.locations(), vec![MetaLocation::InsideSidecar]);
+        assert!(kinds(&ch1).iter().any(|k| matches!(
+            k,
+            FindingKind::MetadataLocationNonconformance {
+                actual: MetaLocation::InsideSidecar,
+                intended: MetaLocation::ParallelSidecar,
+            }
+        )));
+    }
+
+    /// C10 / D3: a sidecar that does not parse is retained with its raw text and error,
+    /// and neither aborts the load nor destroys the rest of the node.
+    #[test]
+    fn a_malformed_sidecar_is_retained_and_not_fatal() {
+        let fs = fs_with(&[
+            ("foo/ch1.md", "body"),
+            ("foo/ch1.meta.toml", "this = = not toml"),
+        ]);
+
+        let ch1 = load_ch1(&fs);
+
+        assert_eq!(ch1.content.content(), Some("body"));
+        let malformed = ch1.metadata.malformed();
+        assert_eq!(malformed.len(), 1);
+        assert!(malformed[0].raw().unwrap().contains("not toml"));
+        assert!(kinds(&ch1)
+            .iter()
+            .any(|k| matches!(k, FindingKind::MalformedMetadata { .. })));
+        // Loading tolerates it; reading a value out of it does not (see meta_tests), and
+        // the refusal names the file on disk rather than the kind of source it was.
+        let err = ch1.metadata.get_str("anything").unwrap_err().to_string();
+        assert!(err.contains("ch1.meta.toml"), "the error names the file: {}", err);
+    }
+
+    /// D6: the same tree is refused up front under a strict policy — the loader walks
+    /// the whole tree, so it can fail before a caller sees a half-trusted entity.
+    #[test]
+    fn a_strict_policy_fails_the_load() {
+        let fs = fs_with(&[
+            ("foo/ch1.md", "body"),
+            ("foo/ch1.meta.toml", "this = = not toml"),
+        ]);
+
+        let strict = loader().with_policy(FindingPolicy::strict());
+        assert!(strict.try_load_root(&fs, &PathBuf::from("foo"), "Root").is_err());
+    }
+
+    /// D4: a finding belongs to the node it was observed on, and `all_findings` walks
+    /// the tree so a caller need not.
+    #[test]
+    fn findings_belong_to_the_node_they_were_observed_on() {
+        let fs = fs_with(&[
+            ("foo/ch1.md", "chapter"),
+            ("foo/ch1/010-intro.md", "section"),
+            ("foo/ch1/010-intro/meta.toml", "k = 1"),
+        ]);
+
+        let root = load_root(&loader(), &fs);
+        let ch1 = &root.children[0];
+        let section = &ch1.children[0];
+
+        assert!(root.findings.is_empty());
+        assert!(ch1.findings.is_empty());
+        assert_eq!(section.findings.len(), 1);
+
+        let all = root.all_findings();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].path, section.path, "a finding carries its own node's path");
+    }
+}

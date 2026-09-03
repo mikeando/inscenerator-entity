@@ -130,7 +130,7 @@ impl ChildBuilder {
     ///
     /// Last call wins.
     pub fn with_metadata_inside(mut self, meta: Metadata) -> Self {
-        self.metadata = Some(EntityMeta::inside(meta));
+        self.metadata = Some(EntityMeta::unplaced(MetaOrigin::InsideSidecar, meta));
         self
     }
 
@@ -138,7 +138,7 @@ impl ChildBuilder {
     ///
     /// Last call wins.
     pub fn with_metadata_parallel(mut self, meta: Metadata) -> Self {
-        self.metadata = Some(EntityMeta::parallel(meta));
+        self.metadata = Some(EntityMeta::unplaced(MetaOrigin::ParallelSidecar, meta));
         self
     }
 
@@ -608,6 +608,7 @@ impl LiveEntity {
             utils::parse_header(&c).map(|(m, separator, _, header_type)| MetaSource {
                 origin: MetaOrigin::Header { header_type, separator },
                 state: MetaState::Parsed(m),
+                entity: Some(self.path.clone()),
             })
         });
 
@@ -629,12 +630,14 @@ impl LiveEntity {
             meta_sources.push(MetaSource {
                 origin: MetaOrigin::ParallelSidecar,
                 state: MetaState::Parsed(m),
+                entity: Some(self.path.clone()),
             });
         }
         if let Some(m) = slash_metadata {
             meta_sources.push(MetaSource {
                 origin: MetaOrigin::InsideSidecar,
                 state: MetaState::Parsed(m),
+                entity: Some(self.path.clone()),
             });
         }
         if let Some(m) = metadata_from_content {
@@ -1115,7 +1118,8 @@ mod tests {
         meta_val.insert("key".to_string(), toml::Value::String("val".to_string()));
         let meta = crate::entity::Metadata { value: toml::Value::Table(meta_val) };
 
-        live.set_metadata(EntityMeta::in_header(meta, None, HeaderType::Yaml)).unwrap();
+        live.set_metadata(EntityMeta::in_header(live.path.clone(), meta, None, HeaderType::Yaml))
+            .unwrap();
         live.set_content("Hello").unwrap();
 
         let content = crate::entity::utils::try_load_file_as_string(&*live.root.fs.lock().unwrap(), &PathBuf::from("foo/entity1.md")).unwrap().unwrap();
@@ -1178,8 +1182,8 @@ mod tests {
 
         // 2. set_metadata (Inside)
         let meta = crate::entity::Metadata { value: toml::from_str("a = 1").unwrap() };
-        live.set_metadata(EntityMeta::inside(meta.clone())).unwrap();
-        assert_eq!(live.metadata().unwrap(), EntityMeta::inside(meta));
+        live.set_metadata(EntityMeta::inside(live.path.clone(), meta.clone())).unwrap();
+        assert_eq!(live.metadata().unwrap(), EntityMeta::inside(live.path.clone(), meta));
 
         // 3. create_child
         live.create_child(EntityPathEntry::Slash("child1".to_string()))
@@ -1891,7 +1895,10 @@ mod tests {
         let meta = Metadata { value: toml::from_str("key = \"val\"").unwrap() };
         let err = live
             .create_child(EntityPathEntry::Slash("child".to_string()))
-            .with_metadata(EntityMeta::in_header(meta, None, crate::entity::HeaderType::Yaml))
+            .with_metadata(EntityMeta::unplaced(
+                MetaOrigin::Header { header_type: crate::entity::HeaderType::Yaml, separator: None },
+                meta,
+            ))
             .build()
             .unwrap_err();
         assert!(err.to_string().contains("InHeader"), "got: {}", err);

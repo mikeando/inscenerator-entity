@@ -1927,6 +1927,25 @@ Two helpers, beside the existing `setup_schema` (`live_entity.rs:1056-1070`):
         // A tree with a malformed sidecar under FindingPolicy::strict():
         // metadata() returns Err, but children() still succeeds.
     }
+
+    /// D3 / C10, matching Task 6's loader: under the default policy a malformed sidecar
+    /// does not stop `metadata()` returning the node's sources, but it does stop a value
+    /// being *read* out of them — "absent" would be a guess about a file we could not read.
+    #[test]
+    fn a_malformed_source_is_reachable_but_not_readable_through() {
+        // foo/e.md with a good header `type = "T"`, foo/e.meta.toml holding "x = = 1".
+        let meta = live.metadata().unwrap();          // the probe itself succeeds
+        assert!(meta.get_str("type").is_err());       // reading through it does not
+        let bad = meta.malformed();                   // ...but the caller can reach it
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0].describe(), "e.meta.toml", "named as the user would name it");
+        assert!(bad[0].raw().unwrap().contains("x = = 1"));
+        assert!(bad[0].error().unwrap().contains("expected"));
+        // The good source is still individually legible, for a caller that wants to
+        // reconstruct the bad one from what survived.
+        let good = meta.source_at(MetaLocation::InHeader).unwrap();
+        assert_eq!(good.metadata().unwrap().get_str("type").unwrap().as_deref(), Some("T"));
+    }
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -2067,6 +2086,27 @@ This implements **§4.3** (precedence when writing) and **§4.5** (per-key routi
 
     #[test]
     fn removing_a_key_removes_it_from_wherever_it_lives() { /* ... */ }
+
+    /// D3: a malformed source can be *replaced* but never *merged into*. Repair is the
+    /// whole reason the raw text is retained, so it must have a way out.
+    #[test]
+    fn a_malformed_source_is_repairable_by_wholesale_replacement() {
+        // foo/e.md + foo/e.meta.toml holding "x = = 1".
+        // Merging refuses, naming the file and what the parser said — and nothing else.
+        let err = live.set_meta_key("k", 1.into()).unwrap_err().to_string();
+        assert!(err.contains("e.meta.toml"), "the refusal names the file: {}", err);
+        // Replacing the whole source succeeds without the old text ever being parsed.
+        live.set_metadata_at(MetaLocation::ParallelSidecar, m("k = 1")).unwrap();
+        assert!(live.metadata().unwrap().malformed().is_empty());
+        assert_eq!(live.metadata().unwrap().get_str_or_int("k").unwrap(), Some(1));
+    }
+
+    /// D3: and a caller who wants the bad file simply gone gets that too — the node
+    /// afterwards reads as having no metadata, not as having unreadable metadata.
+    #[test]
+    fn clear_metadata_removes_a_malformed_source() {
+        // same tree; clear_metadata() then metadata().is_none()
+    }
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -2111,7 +2151,24 @@ New per-key API:
     pub fn clear_metadata(&self) -> anyhow::Result<()>;
 ```
 
-`set_meta_key` reads the target source, inserts the key, and writes only that source back. When the target is `InHeader` it re-renders the header via `utils::format_metadata_header` and rewrites the content file, preserving the body. When the target sidecar does not exist yet it is created (§4.5: "if intent's location does not exist yet, it is created"). Writing to a source whose state is `Malformed` returns `Err` — the library will not merge into text it could not parse.
+`set_meta_key` reads the target source, inserts the key, and writes only that source back. When the target is `InHeader` it re-renders the header via `utils::format_metadata_header` and rewrites the content file, preserving the body. When the target sidecar does not exist yet it is created (§4.5: "if intent's location does not exist yet, it is created").
+
+**Malformed sources: what refuses, and what must not.** Mirror Task 6's `EntityMeta::merged()` rule — a source that did not parse makes every *read-through* accessor fail (`get_str`, `get_vec_of_string`, `merged`), because answering "absent" would be a guess about a file the library could not read. The same reasoning makes `set_meta_key` and `remove_meta_key` return `Err`: both are read-modify-write, and the library will not merge into text it could not parse.
+
+That is only defensible if the caller has a way out, so **three routes must stay open on a malformed node**, and each needs its test above:
+
+1. **Reach it.** `metadata()` still returns the `EntityMeta`; `malformed()`, `source_at(loc)`, `raw()` and `error()` give the caller the offending text and the parse error verbatim. This is why D3 retains the raw text at all — without an accessor it would be dead weight.
+2. **Replace it.** `set_metadata_at(location, m)` **overwrites the whole source** and therefore never parses what was there. It is the repair path and must not inherit the refusal. Its doc comment says so explicitly.
+3. **Delete it.** `clear_metadata()` removes every source including malformed ones, leaving a node that reads as having no metadata rather than unreadable metadata.
+
+The error from routes that do refuse states the problem and stops there: `"Metadata in {path} could not be parsed: {error}"`, via `MetaSource::describe()`. Two rules about that message, both of which cost real work to honour and are easy to get wrong:
+
+- **It names a file, never a `MetaLocation` variant.** `"Metadata at ParallelSidecar could not be parsed"` is a Rust type name leaking into text that a person editing the tree will read, and it does not tell them which file to open. Task 3 was amended for this: `MetaSource` gained `entity: Option<EntityPath>`, set at every construction site in the loader and in `LiveEntity::metadata()`, and `describe()` **computes** the name — `ch1.meta.toml`, `ch1/meta.toml`, or `the front matter of ch1` — through `placement::sidecar_path(Path::new(""), entity, location)`.
+- **It must not name `set_metadata_at` or any other API.** The reader of the message cannot act on advice to call a different Rust method. Routes 1–3 are documented where a programmer will actually look for them: the doc comments on the refusing methods.
+
+**Store identity, not a path.** `(EntityPath, MetaLocation)` already determines the file, so a stored `PathBuf` would be derived state — duplicating `placement`, and going stale the moment `move_to` relocates the node. Storing the `EntityPath` also keeps the field in the same base-independent coordinate system as `Entity.path` and `EntityPath::local_path`, so `PartialEq` can stay derived: a tree written to a new base path and re-loaded compares equal to the original, which is what the round-trip tests assert. A `PathBuf` here would have made those two tests fail, and "exclude the field from equality" would have been the wrong fix for the wrong design.
+
+`entity` is `Option` only because `ChildBuilder` holds metadata for a node that does not exist yet; `EntityMeta::unplaced(origin, m)` covers that and `describe()` falls back to kind-based wording. Task 10 replaces the builder's `EntityMeta` field with `(MetaLocation, Metadata)`, after which the `None` case has no producers and the field can lose its `Option`.
 
 `delete` keeps its shape but derives its file list from `placement` rather than from `dot_metadata_path`'s substituting helper.
 
@@ -2410,6 +2467,35 @@ Expected: FAIL initially if any writer/reader disagreement remains.
 `CHANGELOG.md` — a `0.2.0` entry listing the breaking changes: `create_child` signature, `ChildContentLayout` removed, `EntityMeta` reshaped, `set_metadata` replaced, `add_entity_type` now fallible, `ignore` now regex.
 
 Bump `Cargo.toml` to `0.2.0`.
+
+- [ ] **Step 3a: Sweep the tests for stale doc references**
+
+Every test written during this plan carries a doc comment naming the spec section or
+decision it enforces (`§4.4`, `C1`, `D3`, ...). Those references drift silently: a section
+can be renumbered, merged or rewritten while the test that cites it still passes, so
+nothing catches it. Do the sweep once, here, after the docs above have settled.
+
+**A bare `§4.4` does not say which document it is from.** This repo has at least three that
+carry numbered sections — `docs/storage-layout-v2.md`, the v2 as-built `docs/storage-layout.md`
+rewritten in Step 3 above, and this plan — and the v2 spec is the one that will be *retired*
+once as-built lands, which is exactly when an unqualified reference becomes unresolvable.
+Part of this sweep is therefore normalising every reference to name its file on first use in
+each test module, e.g. a module-level `//! Section references are to docs/storage-layout-v2.md.`
+with bare `§4.4` below it, or `storage-layout-v2 §4.4` inline where a module cites more than
+one document. `C1`–`C11` and `D1`–`D6` are unambiguous today but belong to the v2 spec and this
+plan respectively, so say so once per module too.
+
+```bash
+grep -rn '§[0-9]' src/ | sed 's/.*\(§[0-9.]*\).*/\1/' | sort -u
+grep -rn '\bC1[01]\?\b\|\bC[2-9]\b\|\bD[1-8]\b' src/ --include='*.rs' | grep '///'
+grep -rln '§' src/ | xargs grep -Ln 'Section references are to'   # modules missing the anchor
+```
+
+For each distinct reference, open the named document and confirm the section or defect still
+exists, still has that number, and still says what the test claims it says. Where a section
+number has moved, update the test comment. Where the claim itself has changed, the test is the
+thing to fix, not the comment. Record any reference that no longer resolves to anything as a
+finding for the follow-up plan rather than deleting the test.
 
 - [ ] **Step 4: Run the full verification**
 

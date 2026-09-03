@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
-use crate::entity::{Entity, EntityLoader, EntityPath};
+use crate::entity::{Entity, EntityLoader};
 use crate::placement::{Edge, Layout};
 use inscenerator_xfs::Xfs;
 
@@ -142,7 +142,11 @@ fn compile(desc: &EntityTypeDescription) -> anyhow::Result<CompiledType> {
 #[derive(Default, Clone, Debug)]
 pub struct Schema {
     /// Map of entity type names to their descriptions.
-    pub entity_types: HashMap<String, EntityTypeDescription>,
+    /// Private so it cannot drift from `compiled`: a type inserted here without its
+    /// regexes compiled would be found by `get_entity_type` and missed by `compiled`,
+    /// which is the two-implementations problem C5 exists to close. Read it through
+    /// [`Self::entity_types`]; write it through [`Self::add_entity_type`].
+    entity_types: HashMap<String, EntityTypeDescription>,
     /// The same types with their regexes compiled, kept in step by `add_entity_type`.
     /// Separate because `EntityTypeDescription` is `PartialEq + Serialize` and
     /// `regex::Regex` is neither.
@@ -171,6 +175,11 @@ impl Schema {
     /// # Errors
     ///
     /// Returns an error if the entity type is not found in the schema.
+    /// Every declared type, by name.
+    pub fn entity_types(&self) -> &HashMap<String, EntityTypeDescription> {
+        &self.entity_types
+    }
+
     pub fn get_entity_type(&self, entity_type: &str) -> anyhow::Result<&EntityTypeDescription> {
         self.entity_types
             .get(entity_type)
@@ -255,7 +264,7 @@ pub fn load_schema_and_root(fs: &dyn Xfs, root_path: &Path) -> anyhow::Result<(S
     let mut loader = EntityLoader::new();
     loader.schema = schema.clone();
 
-    let root = loader.try_load_entity(fs, root_path, &EntityPath::empty(), "Auto")?
+    let root = loader.try_load_root(fs, root_path, "Auto")?
         .ok_or_else(|| anyhow!("Root entity not found in {:?}", root_path))?;
 
     Ok((schema, root))
@@ -309,12 +318,12 @@ children = []
     #[test]
     fn types_declare_a_layout_and_rules_declare_an_edge() {
         let s = Schema::load_from_str(EDGE_SCHEMA).unwrap();
-        let chapter = &s.entity_types["Chapter"];
+        let chapter = &s.entity_types()["Chapter"];
         assert_eq!(chapter.layout, Some(Layout::Parallel));
         assert_eq!(chapter.children[0].edge, Edge::Slash);
         assert_eq!(chapter.children[1].edge, Edge::Dot);
         // Section omits `layout`, so it inherits from the parent instance at load time.
-        assert_eq!(s.entity_types["Section"].layout, None);
+        assert_eq!(s.entity_types()["Section"].layout, None);
     }
 
     /// §2 / §3: what a schema that declares nothing optional gets.
@@ -330,7 +339,7 @@ node_type = "T"
 "#,
         )
         .unwrap();
-        let t = &s.entity_types["T"];
+        let t = &s.entity_types()["T"];
         assert_eq!(t.layout, None, "no layout means inherit from the parent instance");
         assert!(t.ignore.is_empty());
         assert_eq!(t.children[0].edge, Edge::Slash, "dot is opted into, never defaulted");
@@ -453,12 +462,12 @@ children = []
 "#,
         )
         .unwrap();
-        assert_eq!(schema.entity_types.len(), 2);
-        assert_eq!(schema.entity_types["Project"].name, "Project");
-        assert_eq!(schema.entity_types["Project"].children.len(), 1);
-        assert_eq!(schema.entity_types["Project"].children[0].node_type, "Chapter");
-        assert_eq!(schema.entity_types["Chapter"].name, "Chapter");
-        assert!(schema.entity_types["Chapter"].allow_additional);
+        assert_eq!(schema.entity_types().len(), 2);
+        assert_eq!(schema.entity_types()["Project"].name, "Project");
+        assert_eq!(schema.entity_types()["Project"].children.len(), 1);
+        assert_eq!(schema.entity_types()["Project"].children[0].node_type, "Chapter");
+        assert_eq!(schema.entity_types()["Chapter"].name, "Chapter");
+        assert!(schema.entity_types()["Chapter"].allow_additional);
     }
 
     #[test]
@@ -482,7 +491,7 @@ children = []
         create_file_with_content(&mut fs, "project/010_chap", "content.md", "Chapter content");
 
         let (schema, root) = load_schema_and_root(&fs, &Path::new("project")).unwrap();
-        assert_eq!(schema.entity_types.len(), 2);
+        assert_eq!(schema.entity_types().len(), 2);
         assert_eq!(root.node_type, "Project");
         assert_eq!(root.children.len(), 1);
         assert_eq!(root.children[0].node_type, "Chapter");
@@ -537,7 +546,7 @@ children = []
         create_file_with_content(&mut fs, "project/booker-data", "some_file.txt", "tool data");
 
         let schema = Schema::load_from_file(&fs, &Path::new("project/schema.toml")).unwrap();
-        assert_eq!(schema.entity_types["Project"].ignore, vec!["booker-data"]);
+        assert_eq!(schema.entity_types()["Project"].ignore, vec!["booker-data"]);
 
         let (_, root) = load_schema_and_root(&fs, &Path::new("project")).unwrap();
         assert_eq!(root.children.len(), 1);
