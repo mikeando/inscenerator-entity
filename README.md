@@ -195,7 +195,7 @@ fn main() -> anyhow::Result<()> {
 
     // Loading an entity tree. The root is always "inside", so it inherits nothing.
     let entity = loader
-        .try_load_root(&fs, &base_path, "Project")?
+        .try_load_root(&fs, base_path, "Project")?
         .ok_or_else(|| anyhow!("Project not found"))?;
 
     println!("Loaded entity: {}", entity.node_type);
@@ -204,7 +204,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Saving an entity tree
-    writer.write_entity(&mut fs, &base_path, &entity)?;
+    writer.write_entity(&mut fs, base_path, &entity)?;
 
     Ok(())
 }
@@ -256,7 +256,56 @@ sit on one edge, a new one joins them rather than following the declaration — 
 never fights the convention already established in it. `.with_edge()` and `.with_layout()`
 override each aspect independently when you mean to.
 
-See `examples/create_child.rs` for a complete runnable example.
+### Editing one node at a time (LiveEntity)
+
+`EntityLoader` reads a whole tree eagerly. `LiveEntity` is the lazy alternative: a handle on
+one path that touches disk only when you ask it something, and writes back immediately.
+
+```rust
+use inscenerator_entity::live_entity::LiveEntity;
+
+// fs is an Arc<Mutex<dyn Xfs + Send + Sync>>; the schema is read from ./my-project/schema.toml
+let book = LiveEntity::load_from_root(fs.clone(), PathBuf::from("./my-project"))?;
+let chapter = book.child("010_chapter-one")?;
+
+chapter.content()?;              // EntityContent
+chapter.metadata()?;             // EntityMeta — every source found, merged per key
+chapter.children()?;             // Vec<LiveEntity>
+chapter.issues()?;               // Vec<Finding> for this node, computed now
+
+chapter.set_content("# Chapter One\n\nRewritten.")?;
+chapter.set_meta_key("word_count", toml::Value::Integer(2600))?;
+chapter.remove_meta_key("draft")?;
+```
+
+Writes route to what the node has **already established**, and only a node with nothing
+there follows its type's intent. A key that already lives in the content file's front matter
+is updated there; a new key joins the sidecar the layout intends. Setting one key never
+relocates another, so a save is not a restructuring.
+
+`move_to` relocates without normalising — every file keeps the layout it arrived with, at the
+new stem, and dot-descendants come along. `delete(recursive)` removes both content locations
+and both sidecars, because it removes the node rather than one shape of it.
+
+## Examples
+
+Each is runnable against an in-memory filesystem: `cargo run --example <name>`.
+
+| Example | What it covers |
+| --- | --- |
+| `create_child` | The `ChildBuilder`: naming a child and letting the schema place it. |
+| `layout_and_edge` | All four edge/layout combinations, layout inheritance, and the overrides. |
+| `load_and_walk` | `EntityLoader` over a `schema.toml` tree, and `EntityWriter` back out. |
+| `live_editing` | `LiveEntity` reads, and where each metadata write lands. |
+| `findings` | A drifted tree under the default, `strict()`, `silent()` and tuned policies. |
+| `move_and_delete` | Relocation, what it drags with it, and what it does not repair. |
+
+## Documentation
+
+*   [`docs/storage-layout.md`](docs/storage-layout.md) — the layout in full: identity, layout,
+    edge, discovery, what reading tolerates, and how writes are routed. The source cites its
+    section numbers.
+*   [`docs/migration-0.1-to-0.2.md`](docs/migration-0.1-to-0.2.md) — what changed in 0.2.
 
 ## Development
 

@@ -1,10 +1,12 @@
-/// Demonstrates the ChildBuilder API for creating child entities.
-///
-/// The point of the v2 API is that the caller names a child and the *schema* decides
-/// where it lands: the parent's rule declares the edge, the child's type declares the
-/// layout. Nothing here builds a path.
-///
-/// Run with: cargo run --example create_child
+//! Creating child entities with `ChildBuilder`.
+//!
+//! The caller names a child and the *schema* decides where it lands: the parent's rule
+//! declares the edge, the child's type declares the layout. Nothing here builds a path.
+//!
+//! Start here, then see `layout_and_edge` for what those two declarations can express.
+//!
+//! Run with: cargo run --example create_child
+
 use inscenerator_entity::entity::{EntityPath, Metadata};
 use inscenerator_entity::live_entity::LiveEntity;
 use inscenerator_entity::placement::{Edge, Layout};
