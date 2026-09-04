@@ -1,13 +1,13 @@
 //! One node, read from disk: its type, its layout, its content and its metadata.
 //!
-//! Section references are to `docs/storage-layout-v2.md`.
+//! Section references are to `docs/storage-layout.md`.
 //!
 //! [`read_node`] is the single implementation of §4.1 and §4.4 — which of the two content
 //! files wins, which metadata sources exist, and what the node's layout turns out to be.
 //! Both [`crate::entity::EntityLoader`], which walks a whole tree eagerly, and
 //! [`crate::live_entity::LiveEntity`], which reads one node at a time, resolve through
-//! here. That shared path is what makes them agree; two implementations of it is defect
-//! C2, and the reason C5 exists.
+//! here. That shared path is what makes them agree: a second implementation of it would
+//! let the two readers reach different conclusions about the same node.
 //!
 //! Nothing here descends. Children are [`crate::discovery`]'s subject, and the callers
 //! differ on what they do with them.
@@ -79,7 +79,7 @@ pub fn read_node(
     let has_inside_content = fs.is_file(&inside_content);
 
     // ---- Sidecars. Both are read; a file that does not parse is kept rather than being
-    // allowed to abort the read (D3).
+    // allowed to abort the read (§4.4).
     let mut meta_sources = Vec::new();
     for location in [MetaLocation::ParallelSidecar, MetaLocation::InsideSidecar] {
         // The root has no parallel sidecar, for the same reason it has no parallel content.
@@ -205,7 +205,7 @@ pub fn read_node(
         }))?;
     }
     for source in metadata.sources() {
-        // In-header metadata is orthogonal to layout (D2), so it is never misplaced.
+        // In-header metadata is orthogonal to layout (§4.5), so it is never misplaced.
         let actual = source.location();
         if actual != MetaLocation::InHeader && actual != layout.sidecar_location() {
             sink.report(at(FindingKind::MetadataLocationNonconformance {
@@ -266,7 +266,7 @@ fn resolve_type(
     sink: &mut FindingSink,
 ) -> anyhow::Result<String> {
     // A malformed source is already reported on its own; falling back here keeps a read
-    // that D3 says must survive from failing on the type lookup instead.
+    // that §4.4 says must survive from failing on the type lookup instead.
     let declared = match metadata.merged() {
         Ok(Some(m)) => m.get_str("type")?,
         Ok(None) | Err(_) => None,

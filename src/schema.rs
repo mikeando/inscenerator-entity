@@ -1,6 +1,6 @@
 //! The schema: what types exist, what children they allow, and where those go.
 //!
-//! Section references are to `docs/storage-layout-v2.md`.
+//! Section references are to `docs/storage-layout.md`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -19,10 +19,10 @@ pub struct ChildEntityRules {
     /// The expected entity type for matching children.
     pub node_type: String,
     /// Whether at least one child matching this rule must exist. Reported as a finding,
-    /// not enforced (D1).
+    /// not enforced (§7.3).
     #[serde(default)]
     pub required: bool,
-    /// Whether more than one child may match this rule. Reported, not enforced (D1).
+    /// Whether more than one child may match this rule. Reported, not enforced (§7.3).
     #[serde(default)]
     pub multiple: bool,
     /// Which edge children matching this rule attach on — `disk(parent)/name` for
@@ -81,7 +81,7 @@ pub struct CompiledType {
 ///
 /// [`CompiledType::match_child`] is the *only* implementation of rule matching; every
 /// site that needs to know a child's type or edge goes through it, so no two callers can
-/// reach different conclusions about the same name (C5).
+/// reach different conclusions about the same name.
 #[derive(Debug)]
 pub enum ChildMatch<'a> {
     /// Matched an `ignore` regex. Produces no child, and is not an error. §7.4.
@@ -148,7 +148,7 @@ pub struct Schema {
     /// Map of entity type names to their descriptions.
     /// Private so it cannot drift from `compiled`: a type inserted here without its
     /// regexes compiled would be found by `get_entity_type` and missed by `compiled`,
-    /// which is the two-implementations problem C5 exists to close. Read it through
+    /// which is exactly the disagreement one matcher exists to prevent. Read it through
     /// [`Self::entity_types`]; write it through [`Self::add_entity_type`].
     entity_types: HashMap<String, EntityTypeDescription>,
     /// The same types with their regexes compiled, kept in step by `add_entity_type`.
@@ -318,7 +318,7 @@ children = []
 "#;
 
     /// §2 / §3: the two declarations this whole design rests on — `layout` on the type,
-    /// `edge` on the parent's rule. C4: neither existed before.
+    /// `edge` on the parent's rule.
     #[test]
     fn types_declare_a_layout_and_rules_declare_an_edge() {
         let s = Schema::load_from_str(EDGE_SCHEMA).unwrap();
@@ -351,7 +351,7 @@ node_type = "T"
         assert!(!t.children[0].multiple);
     }
 
-    /// §7.1 / C5: one matcher decides every child name's fate. `Unexpected` vs
+    /// §7.1: one matcher decides every child name's fate. `Unexpected` vs
     /// `Additional` is the type's `allow_additional`, which is why two types appear here.
     #[test]
     fn match_child_dispatches_to_the_right_outcome() {
@@ -393,8 +393,7 @@ node_type = "T"
         }
     }
 
-    /// C6: `ignore` is a regex list, matched the same way `children` is — it was exact
-    /// string equality while its sibling field was a regex.
+    /// §7.4: `ignore` is a regex list, matched the same way `children` is.
     #[test]
     fn ignore_entries_are_regexes() {
         let s = Schema::load_from_str(
@@ -411,7 +410,7 @@ children = []
         assert!(matches!(t.match_child("visible"), ChildMatch::Unexpected));
     }
 
-    /// C5: every regex is compiled once, when the schema is built. A bad pattern can no
+    /// Every regex is compiled once, when the schema is built. A bad pattern can no
     /// longer surface as an error from one call site and be silently skipped by another,
     /// because there is no schema for the two to disagree over.
     #[test]

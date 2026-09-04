@@ -30,7 +30,7 @@ fn resolve_content_location(node: &reading::NodeRead) -> ContentLocation {
 /// §4.3 for one metadata key: the source that already holds it, else the node's only
 /// source, else what the type intends.
 ///
-/// The middle step is what keeps a mixed node mixed (C7) — a new key joins the sidecar
+/// The middle step is what keeps a mixed node mixed — a new key joins the sidecar
 /// the node actually has rather than creating the one its layout would have chosen.
 fn resolve_meta_location(node: &reading::NodeRead, key: &str) -> MetaLocation {
     if let Some(location) = node.metadata.location_of(key) {
@@ -46,7 +46,7 @@ fn resolve_meta_location(node: &reading::NodeRead, key: &str) -> MetaLocation {
 /// Front matter as it should appear above `body`.
 ///
 /// A source that did not parse is put back inside its delimiters exactly as it was found,
-/// so rewriting the body never destroys a header the library could not read (D3).
+/// so rewriting the body never destroys a header the library could not read (§4.4).
 fn header_text(source: &MetaSource, body: &str) -> anyhow::Result<String> {
     let MetaOrigin::Header { header_type, separator } = &source.origin else {
         bail!("not front matter: {:?}", source.origin);
@@ -83,7 +83,7 @@ pub struct LiveEntityRoot {
     pub base_path: PathBuf,
     /// The schema defining entity types and rules.
     pub schema: Arc<Schema>,
-    /// How severely each kind of drift is treated. Tolerant by default (D6).
+    /// How severely each kind of drift is treated. Tolerant by default (§9.2).
     pub policy: FindingPolicy,
 }
 
@@ -364,7 +364,7 @@ impl ChildBuilder {
 
         // --- Layout (§4.3, §2.1): an override, else what the child's type declares, else
         // the layout of the parent *instance* it is being created under. Independent of
-        // the edge above: coupling them is defect C3.
+        // the edge above, which is what makes §5's shape expressible.
         let child_ctype = self.root.schema.compiled(&resolved_type)?;
         let layout = self
             .layout_override
@@ -590,7 +590,7 @@ impl LiveEntity {
     }
 
     /// Reads this node through the reader the eager loader also uses, so a handle and a
-    /// loaded tree can never disagree about what is here (C2).
+    /// loaded tree can never disagree about what is here.
     fn read_into(&self, sink: &mut FindingSink) -> anyhow::Result<reading::NodeRead> {
         let fs = self.root.fs.lock().unwrap();
         reading::read_node(
@@ -608,7 +608,7 @@ impl LiveEntity {
     ///
     /// A handle reads the whole node whatever you ask it — typing needs the metadata,
     /// which may itself live in the content file — but a lazy reader must abort only the
-    /// accessor that produced the finding (D6). Asking for the children of a node whose
+    /// accessor that produced the finding (§9.2). Asking for the children of a node whose
     /// sidecar is unparseable is a fair question, and gets an answer.
     fn read(&self, owned: &[FindingKindId]) -> anyhow::Result<reading::NodeRead> {
         let mut collected = FindingSink::new(FindingPolicy::tolerant());
@@ -676,8 +676,8 @@ impl LiveEntity {
 
     /// Reads the metadata of the entity from disk, as the set of sources it has.
     ///
-    /// Several sources merge per key (D2). A source that did not parse is kept rather
-    /// than dropped, so it can be inspected and repaired (D3).
+    /// Several sources merge per key (§4.5). A source that did not parse is kept rather
+    /// than dropped, so it can be inspected and repaired (§4.4).
     ///
     /// # Errors
     ///
@@ -788,7 +788,7 @@ impl LiveEntity {
                     .as_table()
                     .cloned()
                     .ok_or_else(|| anyhow!("Metadata at {:?} is not a table", location))?,
-                // D3: replacing the source wholesale is the way to repair one of these.
+                // §4.4: replacing the source wholesale is the way to repair one of these.
                 MetaState::Malformed { .. } => bail!(
                     "Cannot edit metadata in {}: it is not valid TOML. Fix the file, or \
                      replace its contents outright.",
@@ -811,7 +811,7 @@ impl LiveEntity {
     /// Replaces one metadata source outright, whatever was there before.
     ///
     /// Explicit, for a caller that means it — and the way to repair a source that did not
-    /// parse (D3), since nothing here has to read what it is replacing.
+    /// parse (§4.4), since nothing here has to read what it is replacing.
     ///
     /// # Errors
     ///
@@ -971,7 +971,7 @@ impl LiveEntity {
     /// This **relocates and does not normalise** (§9.3): every file keeps the layout it
     /// arrived with, at the new stem. If the node's new position intends a different
     /// layout, that disagreement is a finding on the moved node — [`Self::issues`] will
-    /// report it — not something this call repairs (D5). Normalisation is a separate
+    /// report it — not something this call repairs (§9.3). Normalisation is a separate
     /// operation.
     ///
     /// A moved handle's [`Self::inherited_layout`] is whatever it was before the move,
@@ -990,7 +990,7 @@ impl LiveEntity {
         let mut moved_anything = false;
 
         // The node's own parallel files. The inside pair lives in the stem directory,
-        // which the directory rename below carries; a mixed node (C7) has one of each,
+        // which the directory rename below carries; a mixed node has one of each,
         // so both passes have to run.
         let base = &self.root.base_path;
         let mut own_files = vec![(
@@ -1091,7 +1091,7 @@ impl LiveEntity {
     /// Returns the child with this name.
     ///
     /// Resolution runs through [`Self::children`], which is what guarantees the two can
-    /// never disagree about what exists (C2).
+    /// never disagree about what exists.
     ///
     /// # Errors
     ///
@@ -1747,7 +1747,7 @@ mod tests {
         assert_eq!(content, "Hello Inside");
     }
 
-    /// C3: a dot child is parallel because its *layout* says so, not because of its edge.
+    /// §2 / §3: a dot child is parallel because its *layout* says so, not its edge.
     #[test]
     fn test_with_content_dot_writes_parallel() {
         let mut raw_fs = mockfs::MockFS::new();
@@ -2263,7 +2263,7 @@ children = []
         root_with(files).child("ch1").unwrap()
     }
 
-    /// C2: `child()` and `children()` must never contradict each other about what
+    /// `child()` and `children()` must never contradict each other about what
     /// exists. Two children may share a name across the edges — `(edge, name)` is what
     /// identifies a child — so both are returned, and it is the name-based lookup that
     /// refuses, rather than one of the two entities being quietly discarded.
@@ -2286,7 +2286,7 @@ children = []
         assert!(err.contains("ch1/notes"), "the refusal names both files: {}", err);
     }
 
-    /// C1 (the third site): a dot child's sidecar is its own stem with `.meta.toml`
+    /// §1: a dot child's sidecar is its own stem with `.meta.toml`
     /// appended. Substituting resolved `ch1.review` onto `ch1.meta.toml`, so a handle
     /// on the child read — and would later overwrite — its parent's metadata.
     #[test]
@@ -2316,7 +2316,7 @@ children = []
         assert_eq!(ch1.content().unwrap(), EntityContent::Parallel("parallel body".into()));
     }
 
-    /// D2 / §4.5: two sources merge, and each key still knows which source holds it,
+    /// §4.5 / §4.5: two sources merge, and each key still knows which source holds it,
     /// which is what lets a later write land on the file the key already lives in.
     #[test]
     fn metadata_merges_a_header_and_a_sidecar() {
@@ -2361,7 +2361,7 @@ children = []
         );
     }
 
-    /// D4 (lazy half): drift is reported when it is asked for, and never by failing an
+    /// §9.1 (lazy half): drift is reported when it is asked for, and never by failing an
     /// unrelated read. Here `review` is declared on the dot edge but sits on the slash
     /// edge — it is still a child, and the node around it is still readable.
     #[test]
@@ -2376,7 +2376,7 @@ children = []
         assert_eq!(ch1.children().unwrap().len(), 1);
     }
 
-    /// D6 (lazy half): a handle reads on demand, so an `Error` finding aborts only the
+    /// §9.2 (lazy half): a handle reads on demand, so an `Error` finding aborts only the
     /// accessor that met it. The eager loader fails the whole tree instead.
     #[test]
     fn an_error_finding_fails_only_the_accessor_that_produced_it() {
@@ -2394,7 +2394,7 @@ children = []
         assert_eq!(ch1.content().unwrap(), "chapter", "the content is still readable");
     }
 
-    /// D3: a malformed source is never silently dropped. Reading a value *through* it
+    /// §4.4: a malformed source is never silently dropped. Reading a value *through* it
     /// refuses — the file may well hold that key — and the refusal names the file to
     /// repair, while the raw text stays reachable so a caller can repair it.
     #[test]
@@ -2547,7 +2547,7 @@ mod live_write_tests {
                 &[("foo/ch1.md", "body"), inside_sidecar],
                 "added",
                 "foo/ch1/meta.toml",
-                "C7: the node's only source wins over intent, so a mixed node is not normalised",
+                "the node's only source wins over intent, so a mixed node is not normalised",
             ),
             (
                 &[("foo/ch1.md", "body")],
@@ -2629,7 +2629,7 @@ mod live_write_tests {
         assert_eq!(ch1.content().unwrap(), "body");
     }
 
-    /// D3: a source the library could not parse is still replaceable wholesale — that is
+    /// §4.4: a source the library could not parse is still replaceable wholesale — that is
     /// how a caller repairs one.
     #[test]
     fn a_malformed_source_is_repairable_by_wholesale_replacement() {
@@ -2645,7 +2645,7 @@ mod live_write_tests {
         );
     }
 
-    /// D3: and it is removable, which is the other way to get rid of one.
+    /// §4.4: and it is removable, which is the other way to get rid of one.
     #[test]
     fn clear_metadata_removes_a_malformed_source() {
         let ch1 =
@@ -2655,7 +2655,7 @@ mod live_write_tests {
         assert!(ch1.metadata().unwrap().is_none());
     }
 
-    /// D3: but the library will not merge a key into text it could not parse — that
+    /// §4.4: but the library will not merge a key into text it could not parse — that
     /// would mean writing back a file whose contents it does not understand. The refusal
     /// names the file, because that is what the person fixing it has to open; a Rust
     /// method name would be noise in the tooling these errors surface through.
@@ -2833,7 +2833,7 @@ children = []
         );
     }
 
-    /// C4: the edge a new child attaches on is declared by the parent's rule, not implied
+    /// §3: the edge a new child attaches on is declared by the parent's rule, not implied
     /// by anything the caller says.
     #[test]
     fn a_new_child_goes_on_the_edge_its_rule_declares() {
@@ -2931,7 +2931,7 @@ children = []
     }
 
     /// §4.1: a new child's metadata goes where its layout says, and nowhere else unless
-    /// the caller places it. C3: the edge it hangs off has no say in this.
+    /// the caller places it. The edge it hangs off has no say in this.
     #[test]
     fn metadata_lands_in_the_layouts_sidecar_unless_placed_explicitly() {
         let ch1 = ch1(&[("foo/ch1.md", "chapter")]);
@@ -2972,7 +2972,7 @@ children = []
 }
 
 /// `move_to` relocates; it never normalises. Section references are to
-/// `docs/storage-layout-v2.md`.
+/// `docs/storage-layout.md`.
 #[cfg(test)]
 mod move_tests {
     use super::create_child_tests::{fs_with, tree, SCHEMA};
@@ -2991,7 +2991,7 @@ mod move_tests {
         )
     }
 
-    /// C1's last site: the sidecar suffix is appended to the new stem, so a moved
+    /// §1: the sidecar suffix is appended to the new stem, so a moved
     /// dot-child cannot land on its parent's sidecar.
     #[test]
     fn move_relocates_a_dot_childs_appended_sidecar() {
@@ -3015,7 +3015,7 @@ mod move_tests {
                 "foo/ch1.notes.meta.toml",
             ]
         );
-        // The parent's own metadata is untouched, which is the whole of C1.
+        // The parent's own metadata is untouched, which is the whole point.
         assert_eq!(ch1.metadata().unwrap().get_str("owner").unwrap().as_deref(), Some("chapter"));
     }
 
@@ -3039,7 +3039,7 @@ mod move_tests {
         );
     }
 
-    /// D5: layout survives a move. `fig-1` matches a rule whose type declares `inside`,
+    /// §9.3: layout survives a move. `fig-1` matches a rule whose type declares `inside`,
     /// but the files that arrived are parallel, so they stay parallel and the resulting
     /// disagreement is reported rather than repaired.
     #[test]
@@ -3064,7 +3064,7 @@ mod move_tests {
         )));
     }
 
-    /// C7: a mixed node keeps both of its files. The directory rename carries the inside
+    /// A mixed node keeps both of its files. The directory rename carries the inside
     /// sidecar; the parallel content has to be moved on its own.
     #[test]
     fn move_carries_both_halves_of_a_mixed_node() {
@@ -3102,7 +3102,7 @@ mod move_tests {
 
 /// The strongest check that the writer and the two readers agree: a tree built through
 /// the builder API, read back through both, with nothing to report about it.
-/// Section references are to `docs/storage-layout-v2.md`.
+/// Section references are to `docs/storage-layout.md`.
 #[cfg(test)]
 mod round_trip_tests {
     use super::create_child_tests::{fs_with, tree, SCHEMA};

@@ -1,6 +1,6 @@
 //! Child discovery — the single resolver both readers call. §3.1, §4.2, §4.4.
 //!
-//! Section references are to `docs/storage-layout-v2.md`.
+//! Section references are to `docs/storage-layout.md`.
 //!
 //! Two passes look for children. The **dot pass** scans the parent directory for entries
 //! prefixed `stem.`; the **slash pass** scans the stem directory itself. Each yields
@@ -28,8 +28,7 @@
 //! duplicate.
 //!
 //! Both [`crate::entity::EntityLoader`] and [`crate::live_entity::LiveEntity`] resolve
-//! through here. That shared path is what makes them agree, which is defect C2 in
-//! `docs/storage-layout-v2.md`.
+//! through here. That shared path is what makes them agree about what is on disk.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -231,7 +230,7 @@ pub fn resolve_children(
     Ok(resolved)
 }
 
-/// §4.2 and D1: what each rule has to say about the children that matched it.
+/// §4.2 and §7.3: what each rule has to say about the children that matched it.
 fn report_per_rule(
     ctype: &CompiledType,
     resolved: &[ResolvedChild],
@@ -266,7 +265,7 @@ fn report_per_rule(
             })?;
         }
 
-        // D1: reported, never enforced — every child resolved regardless.
+        // §7.3: reported, never enforced — every child resolved regardless.
         if matched.is_empty() && rule.rule.required {
             sink.report(Finding {
                 path: path.clone(),
@@ -370,7 +369,7 @@ mod tests {
         sink.findings().iter().any(|x| f(&x.kind))
     }
 
-    /// C2: a name on both edges is *two* children — distinct addresses that merely
+    /// A name on both edges is *two* children — distinct addresses that merely
     /// share a name — and the collision is reported rather than resolved away.
     #[test]
     fn a_name_on_both_edges_yields_two_children_and_one_finding() {
@@ -491,7 +490,7 @@ mod tests {
         }
     }
 
-    /// D1 / C9: `required` and `multiple` are reported, never enforced — every child
+    /// §7.3: `required` and `multiple` are reported, never enforced — every child
     /// still resolves.
     #[test]
     fn required_and_multiple_are_reported_not_enforced() {
@@ -517,7 +516,7 @@ mod tests {
         )));
     }
 
-    /// C8: a name matching a rule with no entity behind it resolves without complaint.
+    /// A name matching a rule with no entity behind it resolves without complaint.
     /// Whether it becomes an entity is the loader's call, not discovery's.
     #[test]
     fn a_matched_name_with_no_entity_behind_it_is_not_an_error() {

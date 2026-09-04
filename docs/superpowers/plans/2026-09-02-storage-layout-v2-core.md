@@ -12,6 +12,11 @@
 
 **Spec:** `docs/storage-layout-v2.md`. `docs/storage-layout.md` is the as-built description of the code being replaced.
 
+> **Historical record.** This plan is complete. The spec it cites no longer exists as a separate
+> file: `docs/storage-layout.md` now describes the layout as built, keeping the same section
+> numbers, so a `§n` reference below still resolves there. The C-numbered defects were all fixed
+> and the D-numbered decisions are all stated in that document.
+
 ---
 
 ## Context

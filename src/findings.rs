@@ -1,6 +1,6 @@
 //! Drift reporting. §9.1.
 //!
-//! Section references are to `docs/storage-layout-v2.md`.
+//! Section references are to `docs/storage-layout.md`.
 //!
 //! Two different things are reported here. **Nonconformance** is "this node disagrees
 //! with its schema" — it has an obvious fix, and a tree humans edit by hand is full of
@@ -71,7 +71,7 @@ impl FindingKindId {
 /// What was observed, and enough detail to act on it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FindingKind {
-    /// A metadata source exists but does not parse. D3.
+    /// A metadata source exists but does not parse. §4.4.
     MalformedMetadata {
         location: MetaLocation,
         path: Option<PathBuf>,
@@ -125,12 +125,12 @@ pub enum FindingKind {
         dot_path: PathBuf,
         slash_path: PathBuf,
     },
-    /// A `required` rule with no matching child. D1.
+    /// A `required` rule with no matching child. §7.3.
     MissingRequiredChild {
         rule_index: usize,
         name_regex: String,
     },
-    /// A non-`multiple` rule with several matching children. D1.
+    /// A non-`multiple` rule with several matching children. §7.3.
     MultipleChildrenNotAllowed {
         rule_index: usize,
         names: Vec<String>,
@@ -373,7 +373,7 @@ mod tests {
         }
     }
 
-    /// D6: drift is tolerated by default; what has no defined resolution is not.
+    /// §9.2: drift is tolerated by default; what has no defined resolution is not.
     ///
     /// The table is exhaustive over `FindingKindId`, so a new kind cannot be added
     /// without a deliberate ruling on its default severity.
@@ -411,7 +411,7 @@ mod tests {
         );
     }
 
-    /// D6: severity is per kind, and an override replaces whatever came before it.
+    /// §9.2: severity is per kind, and an override replaces whatever came before it.
     #[test]
     fn severity_is_configurable_per_kind() {
         let policy = FindingPolicy::default().with(FindingKindId::StrayContent, Severity::Error);

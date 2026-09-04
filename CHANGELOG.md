@@ -2,9 +2,9 @@
 
 ## v0.2.0
 
-Storage layout v2. The schema now declares **where** things go, so a caller can create a child
-without knowing the on-disk convention. See `docs/storage-layout.md` for the as-built description
-and `docs/storage-layout-v2.md` for the design argument.
+A new storage layout. The schema now declares **where** things go, so a caller can create a child
+without knowing the on-disk convention. See `docs/storage-layout.md` for the layout as it now is,
+and `docs/migration-0.1-to-0.2.md` for what changed.
 
 ### Breaking
 - `LiveEntity::create_child` and `ChildBuilder::with_child` take a **name** (`&str`), not an
@@ -27,27 +27,28 @@ and `docs/storage-layout-v2.md` for the design argument.
   `layout` and `findings`.
 - `EntityLoader::try_load_entity` takes an `inherited_layout`; new callers should use
   `try_load_root`.
-- `LiveEntity::new` and `load_from_root` take the schema and a `FindingPolicy`.
+- `LiveEntity` gains an `inherited_layout` field, set when a handle is reached through its
+  parent. `LiveEntity::new` builds a root handle, so it starts at `Layout::Inside`.
 
 ### Fixed
-- **C1** — a dot-child's parallel sidecar was computed by *substituting* the extension, so
+- A dot-child's parallel sidecar was computed by *substituting* the extension, so
   `a/b.review` resolved onto its parent's `a/b.meta.toml`. Writing a dot-child overwrote its
   parent's metadata, and the loader could not read back what `LiveEntity` wrote. Every suffix is
   now appended; `with_extension` appears nowhere in `src/`.
-- **C2** — `children()` and `child()` disagreed about a name present on both edges. Both now
+- `children()` and `child()` disagreed about a name present on both edges. Both now
   resolve through `discovery::resolve_children`.
-- **C3** — layout was inferred from the edge, which made a spine file with a folder of children
+- Layout was inferred from the edge, which made a spine file with a folder of children
   beside it unwritable through the library.
-- **C4** — the schema had no way to say which edge a child attaches on.
-- **C5** — two rule-matching implementations, which could disagree.
-- **C6** — `ignore` was exact-match while `children` was regex.
-- **C7** — a node with mixed layouts failed to load; it now loads, is reported, and stays mixed
+- The schema had no way to say which edge a child attaches on.
+- There were two rule-matching implementations, which could disagree.
+- `ignore` was exact-match while `children` was regex.
+- A node with mixed layouts failed to load; it now loads, is reported, and stays mixed
   when an unrelated key is written.
-- **C8** — a rule that matched a name with no files behind it was an error.
-- **C9** — `required` / `multiple` were unenforced *and* unreported; they are now reported.
-- **C10** — a metadata file that did not parse aborted the load. It is now retained with its raw
+- A rule that matched a name with no files behind it was an error.
+- `required` / `multiple` were unenforced *and* unreported; they are now reported.
+- A metadata file that did not parse aborted the load. It is now retained with its raw
   text and error, and written back verbatim.
-- **C11** — the README described root metadata as `project.meta.toml`. The root is always
+- The README described root metadata as `project.meta.toml`. The root is always
   `inside`, so its metadata is `meta.toml` inside the root directory.
 
 ### Added
@@ -60,6 +61,8 @@ and `docs/storage-layout-v2.md` for the design argument.
 - `Entity::all_findings`, `LiveEntity::issues`, `LiveEntity::intended_layout`,
   `LiveEntity::observed`.
 - `ChildBuilder::with_edge`, `with_layout`, `with_metadata_at`.
+- `LiveEntity::with_policy` and `EntityLoader::with_policy` set the drift policy;
+  `LiveEntity::load_from_root_with` takes a schema directly instead of reading `schema.toml`.
 
 ## v0.1.7
 - Exposed `parse_front_matter` as a public API.

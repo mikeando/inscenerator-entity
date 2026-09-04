@@ -1,6 +1,6 @@
 //! The single authority for turning an [`EntityPath`] into a path on disk.
 //!
-//! Section references are to `docs/storage-layout-v2.md`.
+//! Section references are to `docs/storage-layout.md`.
 //!
 //! Every path is built from the entity's **stem** — [`stem`] — by appending or descending:
 //!
@@ -21,8 +21,8 @@
 //! own a `ch1/` directory of sections (§5).
 //!
 //! Every suffix is **appended** to the stem, never substituted. Substituting would make
-//! the dot-child `a/b.review` resolve to its parent's files (`a/b.md`, `a/b.meta.toml`),
-//! which is defect C1 in `docs/storage-layout-v2.md`.
+//! the dot-child `a/b.review` resolve to its parent's files (`a/b.md`, `a/b.meta.toml`).
+//! §1.
 
 use std::path::{Path, PathBuf};
 
@@ -102,7 +102,7 @@ impl Layout {
     /// `Inside` → `<stem>/meta.toml`.
     ///
     /// [`MetaLocation::InHeader`] is never *intended* by a layout, because front matter is
-    /// orthogonal to layout (§11 D2) — but it is always an acceptable observation, so a
+    /// orthogonal to layout (§4.5) — but it is always an acceptable observation, so a
     /// node whose metadata lives in its header is not nonconforming.
     pub fn sidecar_location(self) -> MetaLocation {
         match self {
@@ -145,9 +145,9 @@ pub fn stem(base_path: &Path, path: &EntityPath) -> PathBuf {
 /// | [`ContentLocation::Parallel`] | `<stem>.md` | a readable spine file, sitting beside the entity's directory |
 /// | [`ContentLocation::Inside`] | `<stem>/content.md` | tucked inside the entity's own directory |
 ///
-/// The suffix is **appended** to the stem, never substituted. That is the whole of
-/// defect C1: substituting would give the dot-child `chapters/ch1.review` the path
-/// `chapters/ch1.md`, which is its *parent's* content file.
+/// The suffix is **appended** to the stem, never substituted (§1): substituting would
+/// give the dot-child `chapters/ch1.review` the path `chapters/ch1.md`, which is its
+/// *parent's* content file.
 ///
 /// ```
 /// # use inscenerator_entity::entity::EntityPath;
@@ -280,7 +280,7 @@ mod tests {
         }
     }
 
-    /// §2 / C1: suffixes are **appended** to the stem. Under substitution the dot-child
+    /// §1: suffixes are **appended** to the stem. Under substitution the dot-child
     /// `ch1.review` would resolve to its parent `ch1`'s files, so one sidecar would
     /// serve both entities — and writing the child would clobber the parent.
     #[test]

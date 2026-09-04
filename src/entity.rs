@@ -1,6 +1,6 @@
 //! Entities on disk: the eager reader, the writer, and the types they exchange.
 //!
-//! Section references are to `docs/storage-layout-v2.md`.
+//! Section references are to `docs/storage-layout.md`.
 
 use std::path::{Path, PathBuf};
 
@@ -315,7 +315,7 @@ pub(crate) mod utils {
     ///
     /// A thin adapter over [`crate::discovery`], which owns the scan. Prefer
     /// `discovery::resolve_children`: this pass alone cannot see that a name also exists
-    /// on the other edge, which is what defect C2 was made of.
+    /// on the other edge, so it cannot reconcile the two.
     pub fn find_dot_children(
         fs: &dyn Xfs,
         base_path: &Path,
@@ -351,7 +351,7 @@ pub(crate) mod utils {
     }
 
     /// Loads a sidecar, keeping a file that exists but does not parse rather than
-    /// failing on it (D3). The raw text and the parse error travel with the source so a
+    /// failing on it (§4.4). The raw text and the parse error travel with the source so a
     /// caller can inspect and repair it, and so a save cannot destroy a file the library
     /// could not read.
     pub fn try_load_sidecar(
@@ -474,7 +474,7 @@ pub(crate) mod utils {
     ///
     /// Returns `None` when there is no front matter at all — that is plain content, not a
     /// broken header. Delimiters that *are* present but do not parse yield a `Malformed`
-    /// source carrying the enclosed text, rather than being silently dropped (D3).
+    /// source carrying the enclosed text, rather than being silently dropped (§4.4).
     pub fn parse_header_source(
         content: &str,
         entity: &EntityPath,
@@ -569,7 +569,7 @@ use crate::schema::{Schema, EntityTypeDescription};
 
 pub struct EntityLoader {
     pub schema: Schema,
-    /// How severely each kind of drift is treated. Tolerant by default (D6).
+    /// How severely each kind of drift is treated. Tolerant by default (§9.2).
     pub policy: FindingPolicy,
 }
 
@@ -662,7 +662,7 @@ impl EntityLoader {
                         entity_path.local_path()
                     )
                 })?;
-            // C8: a name that matched a rule but has nothing behind it is simply not a
+            // A name that matched a rule but has nothing behind it is simply not a
             // child. It is not an error.
             if let Some(e) = loaded {
                 children.push(e);
@@ -699,7 +699,7 @@ impl EntityWriter {
     ) -> anyhow::Result<()> {
         // Where the content goes is read from the `EntityContent` variant, which records
         // where this node's content actually is. `entity.layout` is only the *intent*,
-        // and a node whose two halves disagree (C7) must be written back as it stands —
+        // and a node whose two halves disagree must be written back as it stands —
         // a save is not the place to normalise a tree.
         let content_location = match &entity.content {
             EntityContent::Parallel(_) => Some(ContentLocation::Parallel),
@@ -740,7 +740,7 @@ impl EntityWriter {
                         content,
                     )?),
                     // A block we could not parse goes back exactly as it came, so a
-                    // load/save cycle cannot destroy it (D3).
+                    // load/save cycle cannot destroy it (§4.4).
                     MetaState::Malformed { raw, .. } => to_write.push_str(raw),
                 }
             }
@@ -828,7 +828,7 @@ pub enum HeaderType {
 ///
 /// A source that failed to parse is kept rather than dropped, with its raw text and the
 /// error, so a caller can inspect and repair it and so a save cannot destroy a file the
-/// library could not read (D3).
+/// library could not read (§4.4).
 #[derive(Debug, PartialEq, Clone)]
 pub enum MetaState {
     Parsed(Metadata),
@@ -1135,7 +1135,7 @@ pub struct Entity {
     /// the parent instance it was loaded beneath (§2.1). The root is always `Inside`.
     pub layout: Layout,
     /// Drift observed on *this* node. Each child carries its own; use
-    /// [`Self::all_findings`] to walk the tree. §9.1, D4.
+    /// [`Self::all_findings`] to walk the tree. §9.1.
     pub findings: Vec<Finding>,
 }
 
@@ -1271,7 +1271,7 @@ mod meta_tests {
         assert_eq!(m.locations(), vec![MetaLocation::InHeader]);
     }
 
-    /// D2: keys from different sources merge, and each key remembers which source holds
+    /// §4.5: keys from different sources merge, and each key remembers which source holds
     /// it — which is what lets §4.5 write an update back to the file it came from.
     #[test]
     fn disjoint_keys_merge_and_each_remembers_its_source() {
@@ -1291,7 +1291,7 @@ mod meta_tests {
         assert!(m.conflicts().is_empty());
     }
 
-    /// D2: two sources holding the same key agree or they don't. Only disagreement is a
+    /// §4.5: two sources holding the same key agree or they don't. Only disagreement is a
     /// conflict — the default policy makes that an error (§9.1).
     #[test]
     fn a_shared_key_conflicts_only_when_the_values_differ() {
@@ -1367,7 +1367,7 @@ mod meta_tests {
         }
     }
 
-    /// D3 / C10: a source that does not parse keeps its raw text and its error, and does
+    /// §4.4: a source that does not parse keeps its raw text and its error, and does
     /// not take the other source's keys down with it. Previously the parse error
     /// propagated and the whole entity failed to load.
     #[test]
@@ -2147,7 +2147,7 @@ mod entity_tests {
         check_header_meta(&e.metadata, "foo", "bar", Some("\n---\n"));
     }
 
-    /// D2: a header and a sidecar on one node both load, and their keys merge.
+    /// §4.5: a header and a sidecar on one node both load, and their keys merge.
     /// Such a node was previously refused outright.
     #[test]
     fn test_load_entity_merges_header_and_meta_toml() {
@@ -2351,7 +2351,7 @@ mod entity_tests {
         assert!(err.contains("Expected type 'TestType' but metadata declares 'OtherType'"),
             "got: {}", err);
 
-        // §7.1 / D6: the refusal comes from the policy, not from the loader. Downgraded,
+        // §7.1 / §9.2: the refusal comes from the policy, not from the loader. Downgraded,
         // the node loads as the type its parent's rule assigned, with the finding on it.
         let tolerant = dummy_loader()
             .with_policy(FindingPolicy::default().with(FindingKindId::TypeMismatch, Severity::Warn));
@@ -2811,7 +2811,7 @@ children = []
         )));
     }
 
-    /// C1 (reader): a dot child's sidecar is its stem with `.meta.toml` **appended**.
+    /// §1: a dot child's sidecar is its stem with `.meta.toml` **appended**.
     /// Substituting would resolve `ch1.review` onto its parent's `ch1.meta.toml`.
     #[test]
     fn a_dot_childs_sidecar_is_read_from_its_own_appended_name() {
@@ -2871,7 +2871,7 @@ children = []
         assert!(err.contains("root"), "got: {}", err);
     }
 
-    /// C7: a node whose content and metadata follow different layouts loads correctly,
+    /// §4.4: a node whose content and metadata follow different layouts loads correctly,
     /// and the mismatch is reported rather than repaired.
     #[test]
     fn a_mixed_node_loads_and_reports_its_metadata_location() {
@@ -2893,7 +2893,7 @@ children = []
         )));
     }
 
-    /// C10 / D3: a sidecar that does not parse is retained with its raw text and error,
+    /// §4.4: a sidecar that does not parse is retained with its raw text and error,
     /// and neither aborts the load nor destroys the rest of the node.
     #[test]
     fn a_malformed_sidecar_is_retained_and_not_fatal() {
@@ -2917,7 +2917,7 @@ children = []
         assert!(err.contains("ch1.meta.toml"), "the error names the file: {}", err);
     }
 
-    /// D6: the same tree is refused up front under a strict policy — the loader walks
+    /// §9.2: the same tree is refused up front under a strict policy — the loader walks
     /// the whole tree, so it can fail before a caller sees a half-trusted entity.
     #[test]
     fn a_strict_policy_fails_the_load() {
@@ -2930,7 +2930,7 @@ children = []
         assert!(strict.try_load_root(&fs, &PathBuf::from("foo"), "Root").is_err());
     }
 
-    /// D4: a finding belongs to the node it was observed on, and `all_findings` walks
+    /// §9.1: a finding belongs to the node it was observed on, and `all_findings` walks
     /// the tree so a caller need not.
     #[test]
     fn findings_belong_to_the_node_they_were_observed_on() {
@@ -3023,7 +3023,7 @@ children = []
         fs.is_file(&PathBuf::from(path))
     }
 
-    /// C1: a dot child's sidecar suffix is **appended** to its own stem. Substituting
+    /// §1: a dot child's sidecar suffix is **appended** to its own stem. Substituting
     /// it resolved `ch1.review` onto `ch1.meta.toml`, and since children are written
     /// after their parent, the child's metadata replaced the parent's every time.
     #[test]
@@ -3041,7 +3041,7 @@ children = []
         assert_eq!(read(&fs, "bar/ch1.review.md"), "review body");
     }
 
-    /// C1, closing the loop: the loader reads back what the writer wrote, with the two
+    /// Closing the loop: the loader reads back what the writer wrote, with the two
     /// owners still distinct and nothing about the copy drifting from its schema.
     #[test]
     fn dot_child_parallel_sidecar_round_trips() {
@@ -3085,7 +3085,7 @@ children = []
         );
     }
 
-    /// C7 / §4.3: writing does not normalise. A node whose content and sidecar sit in
+    /// §4.3: writing does not normalise. A node whose content and sidecar sit in
     /// different layouts is written back to both of those places, not gathered into the
     /// one its type intends.
     #[test]
@@ -3098,7 +3098,7 @@ children = []
         assert!(!exists(&fs, "bar/ch1/content.md"), "the content is not moved");
     }
 
-    /// D2: metadata split across two sources round-trips as two sources. The writer
+    /// §4.5: metadata split across two sources round-trips as two sources. The writer
     /// previously emitted one, so the other was silently dropped on save.
     #[test]
     fn a_node_with_a_header_and_a_sidecar_writes_both() {
@@ -3118,7 +3118,7 @@ children = []
         assert_eq!(ch1.metadata.location_of("n"), Some(MetaLocation::ParallelSidecar));
     }
 
-    /// D3: a file the library could not parse is written back byte for byte. A save
+    /// §4.4: a file the library could not parse is written back byte for byte. A save
     /// must never be the thing that destroys the text a human still has to repair.
     #[test]
     fn a_malformed_sidecar_is_written_back_verbatim() {
