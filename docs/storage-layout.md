@@ -305,8 +305,9 @@ Severity is configurable **per finding kind** through a `FindingPolicy`:
 | `Error` | recorded, and the call that produced it returns `Err` |
 
 Nonconformance defaults to `Warn`; ambiguity with no defined resolution — a metadata key with two
-different values, a child name found on both edges, a type that contradicts its rule — defaults to
-`Error`. `FindingPolicy::strict()` makes every kind an error, for CI; `silent()` records nothing,
+different values, a type that contradicts its rule — defaults to `Error`. A child name found on
+both edges is *not* one of these: both children load, because `(edge, name)` is what identifies a
+child, and only name-based lookup is ambiguous — which fails at the lookup rather than at the read. `FindingPolicy::strict()` makes every kind an error, for CI; `silent()` records nothing,
 for consumers that only want the data. `with(kind, severity)` overrides one kind.
 
 The two readers differ in when this bites. `EntityLoader` walks the whole tree, so an `Error`
@@ -322,6 +323,11 @@ node's.
 If the node's new position intends a different layout, that is a finding on the moved node, not
 something the move repairs. A moved handle's inherited layout is whatever it was before the move,
 so re-fetch through the new parent's `child()` if the node changed parents.
+
+A move **never overwrites**. The destination is checked the same way `create_child` checks a new
+child's address — directory, both content locations, both sidecars, and any dot child hanging off
+the stem — and an occupied address fails the call with nothing touched. Replacing a node is
+`delete` then `move_to`, so that the deletion is something the caller asked for.
 
 ---
 

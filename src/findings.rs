@@ -262,11 +262,17 @@ impl FindingPolicy {
             return *s;
         }
         match id {
-            // No resolution the library can pick, or a flat schema violation.
-            FindingKindId::MetadataKeyConflict
-            | FindingKindId::UnexpectedChild
-            | FindingKindId::TypeMismatch => Severity::Error,
+            // No resolution the library can pick without inventing one.
+            FindingKindId::MetadataKeyConflict | FindingKindId::TypeMismatch => Severity::Error,
             // Everything else is drift: normal in a tree humans edit by hand.
+            //
+            // `UnexpectedChild` belongs here rather than above, despite being a flat
+            // schema violation: a file nobody declared is the most ordinary thing to
+            // find in a hand-edited tree, and rating it `Error` made one stray note at
+            // a project root enough to stop the whole tree loading. The fix is obvious
+            // — declare it, move it, or ignore it — which is the definition of
+            // nonconformance in this module's terms. Callers that want it fatal have
+            // `strict()`, or `with(UnexpectedChild, Severity::Error)`.
             _ => Severity::Warn,
         }
     }
@@ -394,9 +400,9 @@ mod tests {
             (DuplicateChildName, Warn),
             (MissingRequiredChild, Warn),
             (MultipleChildrenNotAllowed, Warn),
-            // No defined resolution without a human, or a flat schema violation.
+            (UnexpectedChild, Warn),
+            // No defined resolution without a human.
             (MetadataKeyConflict, Error),
-            (UnexpectedChild, Error),
             (TypeMismatch, Error),
         ];
 

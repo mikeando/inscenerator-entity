@@ -442,46 +442,62 @@ impl ChildBuilder {
         })
     }
 
-    /// Anything on disk that this (edge, name) already occupies: its directory, either of
-    /// its content files, either of its sidecars, or a dot child hanging off it.
+    /// Anything on disk that this (edge, name) already occupies. See
+    /// [`existing_trace`].
     fn existing_trace(&self, own_path: &EntityPath, stem: &Path) -> anyhow::Result<Option<PathBuf>> {
-        let base = &self.root.base_path;
-        let fs = self.root.fs.lock().unwrap();
-        if fs.is_dir(stem) {
-            return Ok(Some(stem.to_path_buf()));
-        }
-        for location in [ContentLocation::Parallel, ContentLocation::Inside] {
-            let path = placement::content_path(base, own_path, location);
-            if fs.is_file(&path) {
-                return Ok(Some(path));
-            }
-        }
-        for location in [MetaLocation::ParallelSidecar, MetaLocation::InsideSidecar] {
-            let path = placement::sidecar_path(base, own_path, location)
-                .expect("a sidecar location always has a path");
-            if fs.is_file(&path) {
-                return Ok(Some(path));
-            }
-        }
-        let (Some(dir), Some(name)) = (stem.parent(), stem.file_name().and_then(|n| n.to_str()))
-        else {
-            return Ok(None);
-        };
-        let prefix = format!("{}.", name);
-        if let Ok(entries) = fs.read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let is_descendant = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(&prefix));
-                if is_descendant {
-                    return Ok(Some(path));
-                }
-            }
-        }
-        Ok(None)
+        existing_trace(&self.root, own_path, stem)
     }
+}
+
+/// Anything on disk that `own_path` already occupies: its directory, either of its
+/// content files, either of its sidecars, or a dot child hanging off it.
+///
+/// `None` means the address is free. Every write that would claim an address checks
+/// this first — creating a child, and moving one onto a new path — because "is
+/// something already here?" is not answerable from one filename: a node may be
+/// parallel or inside, may carry a sidecar and no content, and its dot children live
+/// beside it rather than under it.
+fn existing_trace(
+    root: &LiveEntityRoot,
+    own_path: &EntityPath,
+    stem: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    let base = &root.base_path;
+    let fs = root.fs.lock().unwrap();
+    if fs.is_dir(stem) {
+        return Ok(Some(stem.to_path_buf()));
+    }
+    for location in [ContentLocation::Parallel, ContentLocation::Inside] {
+        let path = placement::content_path(base, own_path, location);
+        if fs.is_file(&path) {
+            return Ok(Some(path));
+        }
+    }
+    for location in [MetaLocation::ParallelSidecar, MetaLocation::InsideSidecar] {
+        let path = placement::sidecar_path(base, own_path, location)
+            .expect("a sidecar location always has a path");
+        if fs.is_file(&path) {
+            return Ok(Some(path));
+        }
+    }
+    let (Some(dir), Some(name)) = (stem.parent(), stem.file_name().and_then(|n| n.to_str()))
+    else {
+        return Ok(None);
+    };
+    let prefix = format!("{}.", name);
+    if let Ok(entries) = fs.read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_descendant = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&prefix));
+            if is_descendant {
+                return Ok(Some(path));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Writes `text` to `path`, creating the directories above it.
@@ -978,12 +994,30 @@ impl LiveEntity {
     /// which is stale if the node changed parents. Re-fetch through the new parent's
     /// [`Self::child`] to get one that inherits correctly.
     ///
+    /// A move never overwrites. If anything already occupies the destination — a
+    /// directory, either content file, either sidecar, or a dot child hanging off it —
+    /// the call fails and nothing is touched. Replacing a node is a delete followed by
+    /// a move, so that the deletion is something the caller asked for.
+    ///
     /// # Errors
     ///
-    /// Returns an error if disk access fails or if nothing is found to move.
+    /// Returns an error if the destination is occupied, if disk access fails, or if
+    /// nothing is found to move.
     pub fn move_to(&mut self, new_path: EntityPath) -> anyhow::Result<()> {
         let old_on_disk = self.on_disk_path();
         let new_on_disk = new_path.to_pathbuf(&self.root.base_path);
+
+        if new_path != self.path {
+            let new_stem = placement::stem(&self.root.base_path, &new_path);
+            if let Some(found) = existing_trace(&self.root, &new_path, &new_stem)? {
+                bail!(
+                    "Cannot move to '{}': {:?} is already there. Delete it first if you \
+                     mean to replace it.",
+                    new_path,
+                    found
+                );
+            }
+        }
 
         let mut fs = self.root.fs.lock().unwrap();
 
@@ -2977,6 +3011,7 @@ children = []
 mod move_tests {
     use super::create_child_tests::{fs_with, tree, SCHEMA};
     use super::*;
+    use crate::entity::EntityContent;
     use crate::findings::FindingKind;
     use std::sync::Arc;
 
@@ -3088,6 +3123,46 @@ mod move_tests {
                 "foo/ch1.md",
             ]
         );
+    }
+
+    /// A move never overwrites. `rename` would have taken the destination's content
+    /// with it and returned `Ok`, losing a node with nothing to say it had gone.
+    #[test]
+    fn moving_onto_an_occupied_destination_is_an_error_and_touches_nothing() {
+        let root = root(&[("foo/ch1.md", "chapter one"), ("foo/ch2.md", "chapter two")]);
+        let mut ch1 = root.child("ch1").unwrap();
+
+        let err = ch1
+            .move_to(EntityPath::empty().extend_slash("ch2"))
+            .unwrap_err();
+        assert!(err.to_string().contains("already there"), "got: {}", err);
+
+        assert_eq!(tree(&root), ["foo/ch1.md", "foo/ch2.md"]);
+        assert!(matches!(
+            root.child("ch2").unwrap().content().unwrap(),
+            EntityContent::Parallel(text) if text == "chapter two"
+        ));
+    }
+
+    /// The destination is occupied by anything at all, not just by a content file at
+    /// the same layout: `ch2` here is inside, and `ch1` is parallel.
+    #[test]
+    fn a_destination_occupied_at_the_other_layout_still_blocks_the_move() {
+        let root = root(&[("foo/ch1.md", "chapter one"), ("foo/ch2/content.md", "chapter two")]);
+        let mut ch1 = root.child("ch1").unwrap();
+        let err = ch1
+            .move_to(EntityPath::empty().extend_slash("ch2"))
+            .unwrap_err();
+        assert!(err.to_string().contains("already there"), "got: {}", err);
+    }
+
+    /// Moving a node to where it already is is a no-op, not a collision with itself.
+    #[test]
+    fn moving_a_node_onto_its_own_path_is_allowed() {
+        let root = root(&[("foo/ch1.md", "chapter one")]);
+        let mut ch1 = root.child("ch1").unwrap();
+        ch1.move_to(EntityPath::empty().extend_slash("ch1")).unwrap();
+        assert_eq!(tree(&root), ["foo/ch1.md"]);
     }
 
     #[test]
